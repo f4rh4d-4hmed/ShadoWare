@@ -64,8 +64,13 @@ jobs:
             out="${out}.exe"
           fi
 
+          LDFLAGS="-s -w"
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            LDFLAGS="${LDFLAGS} -H=windowsgui"
+          fi
+
           CGO_ENABLED=0 GOOS="${{ matrix.goos }}" GOARCH="${{ matrix.goarch }}" \
-            go build -trimpath -ldflags="-s -w" -o "${out}" .
+            go build -trimpath -ldflags="${LDFLAGS}" -o "${out}" .
 
           echo "artifact_path=${out}" >> "${GITHUB_OUTPUT}"
 
