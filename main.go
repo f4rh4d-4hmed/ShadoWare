@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
@@ -14,6 +17,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,16 +32,47 @@ import (
 	"golang.org/x/sync/semaphore"
 )
 
-// TaskRequest is the request structure
+// ─── Config ───────────────────────────────────────────────────────────────────
+
+// Config holds all startup options, populated from CLI flags.
+// Every field has a sensible default so zero-config works out of the box.
+type Config struct {
+	Port     string        // e.g. ":8080" or "0.0.0.0:9000"
+	Headless bool          // run browser headless
+	MaxTabs  int           // max concurrent one-shot scrapes
+	Browser  string        // explicit browser path; auto-detected if empty
+	Timeout  time.Duration // per-request deadline
+	Mode     string        // default scrape mode: "extension" | "cdp"
+}
+
+func parseConfig() Config {
+	var cfg Config
+	flag.StringVar(&cfg.Port, "port", ":8080", "HTTP listen address (e.g. :8080 or 0.0.0.0:9000)")
+	flag.BoolVar(&cfg.Headless, "headless", false, "Run browser headless (set true for production)")
+	flag.IntVar(&cfg.MaxTabs, "max-tabs", 5, "Max concurrent browser tabs for one-shot /execute")
+	flag.StringVar(&cfg.Browser, "browser", "", "Override browser executable path (auto-detected if empty)")
+	flag.DurationVar(&cfg.Timeout, "timeout", 120*time.Second, "Per-request timeout")
+	flag.StringVar(&cfg.Mode, "mode", "extension", "Default scrape mode: extension | cdp")
+	flag.Parse()
+
+	if !strings.HasPrefix(cfg.Port, ":") && !strings.Contains(cfg.Port, ":") {
+		cfg.Port = ":" + cfg.Port
+	}
+	cfg.Mode = strings.ToLower(cfg.Mode)
+	return cfg
+}
+
+// ─── Core types ───────────────────────────────────────────────────────────────
+
 type TaskRequest struct {
-	URL          string            `json:"url"`
-	Mode         string            `json:"mode,omitempty"`
-	WaitMs       int               `json:"wait_ms"`
-	LocalStorage map[string]string `json:"local_storage,omitempty"`
-	Actions      []BrowserAction   `json:"actions,omitempty"`
-	Debug        bool              `json:"debug,omitempty"`
-	IncludeHeaders bool            `json:"include_headers,omitempty"`
-	Stream       bool              `json:"stream,omitempty"`
+	URL            string            `json:"url"`
+	Mode           string            `json:"mode,omitempty"`
+	WaitMs         int               `json:"wait_ms"`
+	LocalStorage   map[string]string `json:"local_storage,omitempty"`
+	Actions        []BrowserAction   `json:"actions,omitempty"`
+	Debug          bool              `json:"debug,omitempty"`
+	IncludeHeaders bool              `json:"include_headers,omitempty"`
+	Stream         bool              `json:"stream,omitempty"`
 }
 
 type BrowserAction struct {
@@ -52,7 +87,6 @@ type BrowserAction struct {
 	WaitMs   int     `json:"wait_ms,omitempty"`
 }
 
-// TaskResponse is what we send back
 type TaskResponse struct {
 	Content     string              `json:"content"`
 	M3u8URLs    []string            `json:"m3u8_urls,omitempty"`
@@ -77,539 +111,408 @@ type StreamEvent struct {
 	Error    string        `json:"error,omitempty"`
 }
 
-const (
-	maxConcurrentTabs = 5
-	requestTimeout    = 120 * time.Second
-	serverAddr        = ":8080"
-	maxHeaderProbes   = 8
-	headerProbeTimeout = 12 * time.Second
-)
+// ─── Tab pool ─────────────────────────────────────────────────────────────────
 
-var nextExtensionJobID atomic.Uint64
+// Tab is a persistent browser tab controlled by the caller over the REST API.
+type Tab struct {
+	ID        string    `json:"id"`
+	URL       string    `json:"url"`
+	Status    string    `json:"status"` // loading | ready | error
+	CreatedAt time.Time `json:"created_at"`
+	ErrMsg    string    `json:"error,omitempty"`
 
-type extensionCaptureEvent struct {
-	JobID     string `json:"job_id,omitempty"`
-	URL       string `json:"url"`
-	TabID     int    `json:"tab_id"`
-	FrameID   int    `json:"frame_id"`
-	RequestID string `json:"request_id"`
-	Type      string `json:"type"`
-	Initiator string `json:"initiator,omitempty"`
+	ctx    context.Context
+	cancel context.CancelFunc
+	mu     sync.Mutex
+	m3u8s  []string
+	urls   []string
 }
 
-type extensionCaptureSession struct {
-	jobID    string
-	startURL string
-	hasTabID bool
-	tabID    int
-	trackURL func(string)
-}
-
-type extensionCaptureHub struct {
-	mu       sync.Mutex
-	sessions map[*extensionCaptureSession]struct{}
-}
-
-type extensionJob struct {
-	JobID        string            `json:"job_id"`
-	URL          string            `json:"url"`
-	WaitMs       int               `json:"wait_ms"`
-	LocalStorage map[string]string `json:"local_storage,omitempty"`
-	Actions      []BrowserAction   `json:"actions,omitempty"`
-	CloseTab     bool              `json:"close_tab"`
-}
-
-type extensionJobResult struct {
-	JobID   string `json:"job_id"`
-	Content string `json:"content"`
-	Error   string `json:"error,omitempty"`
-}
-
-type extensionJobHub struct {
-	mu      sync.Mutex
-	queue   []*extensionJob
-	results map[string]chan extensionJobResult
-}
-
-type extensionBrowserProcess struct {
-	cmd        *exec.Cmd
-	profileDir string
-}
-
-func newExtensionCaptureHub() *extensionCaptureHub {
-	return &extensionCaptureHub{
-		sessions: make(map[*extensionCaptureSession]struct{}),
+func (t *Tab) info() map[string]interface{} {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return map[string]interface{}{
+		"id":         t.ID,
+		"url":        t.URL,
+		"status":     t.Status,
+		"created_at": t.CreatedAt,
+		"error":      t.ErrMsg,
+		"url_count":  len(t.urls),
+		"m3u8_count": len(t.m3u8s),
 	}
 }
 
-func newExtensionJobHub() *extensionJobHub {
-	return &extensionJobHub{
-		results: make(map[string]chan extensionJobResult),
+// TabPool manages long-lived CDP tabs that external callers can control.
+type TabPool struct {
+	mu   sync.RWMutex
+	tabs map[string]*Tab
+	bm   *BrowserManager
+}
+
+func newTabPool(bm *BrowserManager) *TabPool {
+	return &TabPool{tabs: make(map[string]*Tab), bm: bm}
+}
+
+func (p *TabPool) Open(reqURL string) (*Tab, error) {
+	allocCtx := p.bm.AllocCtx()
+	tabCtx, tabCancel := chromedp.NewContext(allocCtx)
+
+	tab := &Tab{
+		ID:        newID(),
+		URL:       reqURL,
+		Status:    "loading",
+		CreatedAt: time.Now(),
+		ctx:       tabCtx,
+		cancel:    tabCancel,
+	}
+
+	trackURL := func(u string) {
+		u = normalizeCapturedURL(u, reqURL)
+		if u == "" {
+			return
+		}
+		tab.mu.Lock()
+		tab.urls = append(tab.urls, u)
+		if isMediaCandidateURL(u) {
+			tab.m3u8s = append(tab.m3u8s, u)
+		}
+		tab.mu.Unlock()
+	}
+	trackText := func(text, base string) {
+		for _, u := range extractCandidateURLs(text, base) {
+			trackURL(u)
+		}
+	}
+
+	scanner := newResponseBodyScanner()
+	mainHandler := scanner.listen(tabCtx, trackURL, trackText)
+	var attachChild func(context.Context, target.ID)
+	attachChild = func(parent context.Context, tid target.ID) {
+		cctx, _ := chromedp.NewContext(parent, chromedp.WithTargetID(tid))
+		ch := scanner.listen(cctx, trackURL, trackText)
+		chromedp.ListenTarget(cctx, func(ev interface{}) {
+			ch(ev)
+			if e, ok := ev.(*target.EventAttachedToTarget); ok {
+				go attachChild(cctx, e.TargetInfo.TargetID)
+			}
+		})
+		go chromedp.Run(cctx,
+			target.SetAutoAttach(true, false).WithFlatten(true),
+			network.Enable().WithMaxTotalBufferSize(100*1024*1024).WithMaxResourceBufferSize(maxResponseBodyScanBytes),
+		)
+	}
+	chromedp.ListenTarget(tabCtx, func(ev interface{}) {
+		mainHandler(ev)
+		if e, ok := ev.(*target.EventAttachedToTarget); ok {
+			t := string(e.TargetInfo.Type)
+			if t == "iframe" || t == "page" || t == "service_worker" || t == "worker" {
+				go attachChild(tabCtx, e.TargetInfo.TargetID)
+			}
+		}
+	})
+
+	p.mu.Lock()
+	p.tabs[tab.ID] = tab
+	p.mu.Unlock()
+
+	// Navigate asynchronously so the caller gets the tab ID immediately.
+	go func() {
+		err := chromedp.Run(tabCtx,
+			target.SetAutoAttach(true, false).WithFlatten(true),
+			network.Enable().WithMaxTotalBufferSize(100*1024*1024),
+			chromedp.ActionFunc(func(ctx context.Context) error {
+				_, err := page.AddScriptToEvaluateOnNewDocument(stealthScript).Do(ctx)
+				return err
+			}),
+			chromedp.Navigate(reqURL),
+			chromedp.WaitReady("body", chromedp.ByQuery),
+		)
+		tab.mu.Lock()
+		if err != nil {
+			tab.Status = "error"
+			tab.ErrMsg = err.Error()
+		} else {
+			tab.Status = "ready"
+		}
+		tab.mu.Unlock()
+	}()
+
+	return tab, nil
+}
+
+func (p *TabPool) Get(id string) (*Tab, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	t, ok := p.tabs[id]
+	return t, ok
+}
+
+func (p *TabPool) Close(id string) bool {
+	p.mu.Lock()
+	t, ok := p.tabs[id]
+	if ok {
+		delete(p.tabs, id)
+	}
+	p.mu.Unlock()
+	if ok {
+		t.cancel()
+	}
+	return ok
+}
+
+func (p *TabPool) CloseAll() {
+	p.mu.Lock()
+	tabs := make([]*Tab, 0, len(p.tabs))
+	for _, t := range p.tabs {
+		tabs = append(tabs, t)
+	}
+	p.tabs = make(map[string]*Tab)
+	p.mu.Unlock()
+	for _, t := range tabs {
+		t.cancel()
 	}
 }
 
-func (h *extensionJobHub) enqueue(job *extensionJob) <-chan extensionJobResult {
-	resultCh := make(chan extensionJobResult, 1)
-
-	h.mu.Lock()
-	h.queue = append(h.queue, job)
-	h.results[job.JobID] = resultCh
-	h.mu.Unlock()
-
-	return resultCh
-}
-
-func (h *extensionJobHub) next() (*extensionJob, bool) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	if len(h.queue) == 0 {
-		return nil, false
+func (p *TabPool) List() []map[string]interface{} {
+	p.mu.RLock()
+	tabs := make([]*Tab, 0, len(p.tabs))
+	for _, t := range p.tabs {
+		tabs = append(tabs, t)
 	}
-
-	job := h.queue[0]
-	copy(h.queue, h.queue[1:])
-	h.queue[len(h.queue)-1] = nil
-	h.queue = h.queue[:len(h.queue)-1]
-	return job, true
+	p.mu.RUnlock()
+	sort.Slice(tabs, func(i, j int) bool {
+		return tabs[i].CreatedAt.Before(tabs[j].CreatedAt)
+	})
+	out := make([]map[string]interface{}, len(tabs))
+	for i, t := range tabs {
+		out[i] = t.info()
+	}
+	return out
 }
 
-func (h *extensionJobHub) complete(result extensionJobResult) bool {
-	h.mu.Lock()
-	resultCh := h.results[result.JobID]
-	delete(h.results, result.JobID)
-	h.mu.Unlock()
+func (p *TabPool) Navigate(id, newURL string) error {
+	t, ok := p.Get(id)
+	if !ok {
+		return errors.New("tab not found")
+	}
+	t.mu.Lock()
+	t.Status = "loading"
+	t.URL = newURL
+	t.mu.Unlock()
 
-	if resultCh == nil {
+	err := chromedp.Run(t.ctx,
+		chromedp.Navigate(newURL),
+		chromedp.WaitReady("body", chromedp.ByQuery),
+	)
+	t.mu.Lock()
+	if err != nil {
+		t.Status = "error"
+		t.ErrMsg = err.Error()
+	} else {
+		t.Status = "ready"
+		t.ErrMsg = ""
+	}
+	t.mu.Unlock()
+	return err
+}
+
+func (p *TabPool) RunActions(id string, actions []BrowserAction, waitMs int) (string, error) {
+	t, ok := p.Get(id)
+	if !ok {
+		return "", errors.New("tab not found")
+	}
+	cdpActions := make([]chromedp.Action, 0, len(actions)+2)
+	for _, a := range actions {
+		cdpActions = append(cdpActions, buildBrowserAction(a))
+	}
+	if waitMs > 0 {
+		cdpActions = append(cdpActions, chromedp.Sleep(time.Duration(waitMs)*time.Millisecond))
+	}
+	var html string
+	cdpActions = append(cdpActions, chromedp.OuterHTML("html", &html))
+	return html, chromedp.Run(t.ctx, cdpActions...)
+}
+
+func (p *TabPool) Snapshot(id string) (string, []string, []string, error) {
+	t, ok := p.Get(id)
+	if !ok {
+		return "", nil, nil, errors.New("tab not found")
+	}
+	var html string
+	if err := chromedp.Run(t.ctx, chromedp.OuterHTML("html", &html)); err != nil {
+		return "", nil, nil, err
+	}
+	t.mu.Lock()
+	m3u8s := dedupe(append([]string(nil), t.m3u8s...))
+	urls := dedupe(append([]string(nil), t.urls...))
+	t.mu.Unlock()
+	return html, m3u8s, urls, nil
+}
+
+func (p *TabPool) Evaluate(id, script string) (interface{}, error) {
+	t, ok := p.Get(id)
+	if !ok {
+		return nil, errors.New("tab not found")
+	}
+	var result interface{}
+	err := chromedp.Run(t.ctx, chromedp.Evaluate(script, &result))
+	return result, err
+}
+
+func (p *TabPool) ClearURLs(id string) bool {
+	t, ok := p.Get(id)
+	if !ok {
 		return false
 	}
-	resultCh <- result
+	t.mu.Lock()
+	t.m3u8s = nil
+	t.urls = nil
+	t.mu.Unlock()
 	return true
 }
 
-func (h *extensionJobHub) cancel(jobID string) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+// ─── Browser Manager ──────────────────────────────────────────────────────────
 
-	delete(h.results, jobID)
-	for i, job := range h.queue {
-		if job.JobID == jobID {
-			copy(h.queue[i:], h.queue[i+1:])
-			h.queue[len(h.queue)-1] = nil
-			h.queue = h.queue[:len(h.queue)-1]
-			return
-		}
+// BrowserManager owns the allocator context and can restart the browser.
+type BrowserManager struct {
+	mu          sync.RWMutex
+	allocCtx    context.Context
+	allocCancel context.CancelFunc
+	opts        []chromedp.ExecAllocatorOption
+	pool        *TabPool
+	browserPath string
+	browserName string
+	startedAt   time.Time
+}
+
+func newBrowserManager(browserPath, browserName string, opts []chromedp.ExecAllocatorOption) *BrowserManager {
+	allocCtx, allocCancel := chromedp.NewExecAllocator(context.Background(), opts...)
+	bm := &BrowserManager{
+		allocCtx:    allocCtx,
+		allocCancel: allocCancel,
+		opts:        opts,
+		browserPath: browserPath,
+		browserName: browserName,
+		startedAt:   time.Now(),
+	}
+	return bm
+}
+
+func (bm *BrowserManager) AllocCtx() context.Context {
+	bm.mu.RLock()
+	defer bm.mu.RUnlock()
+	return bm.allocCtx
+}
+
+func (bm *BrowserManager) Restart() {
+	bm.mu.Lock()
+	defer bm.mu.Unlock()
+
+	// Close all persistent tabs before killing the browser.
+	if bm.pool != nil {
+		bm.pool.CloseAll()
+	}
+	bm.allocCancel()
+
+	bm.allocCtx, bm.allocCancel = chromedp.NewExecAllocator(context.Background(), bm.opts...)
+	bm.startedAt = time.Now()
+	log.Println("Browser restarted")
+}
+
+func (bm *BrowserManager) Status() map[string]interface{} {
+	bm.mu.RLock()
+	defer bm.mu.RUnlock()
+	return map[string]interface{}{
+		"browser":    bm.browserName,
+		"path":       bm.browserPath,
+		"started_at": bm.startedAt,
+		"uptime":     time.Since(bm.startedAt).String(),
 	}
 }
 
-func (h *extensionCaptureHub) register(jobID, startURL string, trackURL func(string)) func() {
-	session := &extensionCaptureSession{
-		jobID:    jobID,
-		startURL: normalizeCapturedURL(startURL, ""),
-		trackURL: trackURL,
-	}
+// ─── Constants ────────────────────────────────────────────────────────────────
 
-	h.mu.Lock()
-	h.sessions[session] = struct{}{}
-	h.mu.Unlock()
+const (
+	maxHeaderProbes        = 8
+	headerProbeTimeout     = 12 * time.Second
+	maxResponseBodyScanBytes = 2 * 1024 * 1024
+)
 
-	return func() {
-		h.mu.Lock()
-		delete(h.sessions, session)
-		h.mu.Unlock()
-	}
-}
+var (
+	nextExtensionJobID atomic.Uint64
+	mediaURLPattern    = regexp.MustCompile(`(?i)[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*(?:\.m3u8|m3u8|\.mpd|/playlist|/master|manifest)[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*`)
+)
 
-func (h *extensionCaptureHub) capture(ev extensionCaptureEvent) {
-	if ev.URL == "" || ev.TabID < 0 {
-		return
-	}
-
-	normalizedURL := normalizeCapturedURL(ev.URL, "")
-	var trackers []func(string)
-
-	h.mu.Lock()
-	for session := range h.sessions {
-		if session.jobID != "" {
-			if session.jobID == ev.JobID {
-				trackers = append(trackers, session.trackURL)
-			}
-			continue
-		}
-
-		if session.hasTabID {
-			if session.tabID == ev.TabID {
-				trackers = append(trackers, session.trackURL)
-			}
-			continue
-		}
-
-		if ev.Type == "main_frame" && sameCapturedURL(normalizedURL, session.startURL) {
-			session.hasTabID = true
-			session.tabID = ev.TabID
-			trackers = append(trackers, session.trackURL)
-		}
-	}
-	h.mu.Unlock()
-
-	for _, trackURL := range trackers {
-		trackURL(ev.URL)
-	}
-}
-
-func ensureCaptureExtension() (string, error) {
-	dir := filepath.Join(os.TempDir(), "shadoware-capture-extension")
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return "", err
-	}
-
-	manifest := `{
-  "manifest_version": 3,
-  "name": "ShadoWare Capture",
-  "version": "1.0.0",
-  "description": "Extension-side browser control and passive request URL capture for ShadoWare.",
-  "permissions": ["webRequest", "tabs", "scripting"],
-  "host_permissions": ["<all_urls>"],
-  "background": {
-    "service_worker": "background.js"
-  }
-}
-`
-	apiBase := "http://127.0.0.1" + serverAddr
-	background := fmt.Sprintf(`const API_BASE = %q;
-const CAPTURE_ENDPOINT = API_BASE + "/extension-capture";
-const COMMAND_ENDPOINT = API_BASE + "/extension-command";
-const RESULT_ENDPOINT = API_BASE + "/extension-result";
-const tabJobs = new Map();
-
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-async function postJSON(url, body) {
-  await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body)
-  });
-}
-
-chrome.webRequest.onBeforeRequest.addListener((details) => {
-  if (!details.url || details.url.startsWith(CAPTURE_ENDPOINT)) return;
-  const jobId = tabJobs.get(details.tabId);
-  if (!jobId) return;
-
-  postJSON(CAPTURE_ENDPOINT, {
-    job_id: jobId,
-    url: details.url,
-    tab_id: details.tabId,
-    frame_id: details.frameId,
-    request_id: details.requestId,
-    type: details.type,
-    initiator: details.initiator || ""
-  }).catch(() => {});
-}, { urls: ["<all_urls>"] });
-
-function waitForTabComplete(tabId, timeoutMs = 30000) {
-  return new Promise((resolve) => {
-    let done = false;
-    const finish = () => {
-      if (done) return;
-      done = true;
-      chrome.tabs.onUpdated.removeListener(listener);
-      resolve();
-    };
-    const listener = (updatedTabId, info) => {
-      if (updatedTabId === tabId && info.status === "complete") finish();
-    };
-    chrome.tabs.onUpdated.addListener(listener);
-    chrome.tabs.get(tabId).then((tab) => {
-      if (tab.status === "complete") finish();
-    }).catch(finish);
-    setTimeout(finish, timeoutMs);
-  });
-}
-
-async function runAction(tabId, action) {
-  const type = String(action.type || "").toLowerCase();
-  if (type === "wait" || type === "sleep") {
-    await sleep(action.wait_ms || 0);
-    return;
-  }
-
-  if (type === "wait_ready") {
-    const selector = action.selector;
-    const timeout = action.wait_ms || 10000;
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      args: [selector, timeout],
-      func: async (selector, timeout) => {
-        const start = Date.now();
-        while (!document.querySelector(selector) && Date.now() - start < timeout) {
-          await new Promise((resolve) => setTimeout(resolve, 100));
-        }
-      }
-    });
-    return;
-  }
-
-  if (type === "click" || type === "double_click") {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      args: [action.selector || "", action.x || 0, action.y || 0, type === "double_click"],
-      func: (selector, x, y, doubleClick) => {
-        const el = selector ? document.querySelector(selector) : document.elementFromPoint(x, y);
-        if (!el) return;
-        el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, view: window }));
-        el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true, view: window }));
-        el.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
-        if (doubleClick) {
-          el.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, cancelable: true, view: window }));
-        }
-      }
-    });
-    return;
-  }
-
-  if (type === "scroll") {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      args: [action.delta_x || 0, action.delta_y || 0],
-      func: (deltaX, deltaY) => window.scrollBy(deltaX, deltaY)
-    });
-    return;
-  }
-
-  if (type === "send_keys" || type === "type") {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      args: [action.selector, action.text || ""],
-      func: (selector, text) => {
-        const el = document.querySelector(selector);
-        if (!el) return;
-        el.focus();
-        el.value = text;
-        el.dispatchEvent(new Event("input", { bubbles: true }));
-        el.dispatchEvent(new Event("change", { bubbles: true }));
-      }
-    });
-    return;
-  }
-
-  if (type === "evaluate" || type === "eval") {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      args: [action.script || ""],
-      world: "MAIN",
-      func: (script) => {
-        (0, eval)(script);
-      }
-    });
-  }
-}
-
-async function runJob(job) {
-  let tab;
-  try {
-    tab = await chrome.tabs.create({ url: job.url, active: true });
-    tabJobs.set(tab.id, job.job_id);
-    await waitForTabComplete(tab.id);
-
-    if (job.local_storage && Object.keys(job.local_storage).length) {
-      await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        args: [job.local_storage],
-        func: (items) => {
-          for (const [key, value] of Object.entries(items)) {
-            localStorage.setItem(key, value);
-          }
-        }
-      });
-      await chrome.tabs.reload(tab.id);
-      await waitForTabComplete(tab.id);
-    }
-
-    for (const action of job.actions || []) {
-      await runAction(tab.id, action);
-    }
-
-    if (job.wait_ms) await sleep(job.wait_ms);
-
-    const frames = await chrome.scripting.executeScript({
-      target: { tabId: tab.id, allFrames: true },
-      func: () => document.documentElement.outerHTML
-    });
-    const content = frames.map((frame) => frame.result || "").join("\n");
-    await postJSON(RESULT_ENDPOINT, {
-      job_id: job.job_id,
-      content
-    });
-  } catch (e) {
-    await postJSON(RESULT_ENDPOINT, {
-      job_id: job.job_id,
-      content: "",
-      error: e && e.message ? e.message : String(e)
-    }).catch(() => {});
-  } finally {
-    if (tab && tab.id !== undefined) {
-      tabJobs.delete(tab.id);
-      if (job.close_tab !== false) {
-        chrome.tabs.remove(tab.id).catch(() => {});
-      }
-    }
-  }
-}
-
-async function pollCommands() {
-  for (;;) {
-    try {
-      const response = await fetch(COMMAND_ENDPOINT);
-      if (response.status === 200) {
-        await runJob(await response.json());
-      } else {
-        await sleep(500);
-      }
-    } catch (_) {
-      await sleep(1000);
-    }
-  }
-}
-
-pollCommands();
-`, apiBase)
-
-	if err := os.WriteFile(filepath.Join(dir, "manifest.json"), []byte(manifest), 0644); err != nil {
-		return "", err
-	}
-	if err := os.WriteFile(filepath.Join(dir, "background.js"), []byte(background), 0644); err != nil {
-		return "", err
-	}
-	return dir, nil
-}
-
-func launchExtensionBrowser(browserPath, extensionDir, jobID string) (*extensionBrowserProcess, error) {
-	profileDir, err := os.MkdirTemp("", "shadoware-browser-profile-"+safeFilePart(jobID)+"-")
-	if err != nil {
-		return nil, err
-	}
-
-	args := []string{
-		"--user-data-dir=" + profileDir,
-		"--headless=new",
-		"--no-first-run",
-		"--no-default-browser-check",
-		"--disable-gpu",
-		"--disable-blink-features=AutomationControlled",
-		"--disable-extensions-except=" + extensionDir,
-		"--load-extension=" + extensionDir,
-		"--window-size=1365,768",
-		"--mute-audio",
-		"about:blank",
-	}
-
-	cmd := exec.Command(browserPath, args...)
-	if err := cmd.Start(); err != nil {
-		_ = os.RemoveAll(profileDir)
-		return nil, err
-	}
-	return &extensionBrowserProcess{cmd: cmd, profileDir: profileDir}, nil
-}
-
-func closeExtensionBrowser(browser *extensionBrowserProcess) {
-	if browser == nil {
-		return
-	}
-	if browser.cmd != nil && browser.cmd.Process != nil {
-		if runtime.GOOS == "windows" {
-			_ = exec.Command("taskkill", "/PID", strconv.Itoa(browser.cmd.Process.Pid), "/T", "/F").Run()
-		} else {
-			_ = browser.cmd.Process.Kill()
-		}
-
-		done := make(chan struct{})
-		go func() {
-			_ = browser.cmd.Wait()
-			close(done)
-		}()
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-		}
-	}
-	if browser.profileDir != "" && strings.HasPrefix(filepath.Base(browser.profileDir), "shadoware-browser-profile-") {
-		_ = os.RemoveAll(browser.profileDir)
-	}
-}
-
-func safeFilePart(s string) string {
-	var b strings.Builder
-	for _, r := range s {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
-			b.WriteRune(r)
-		}
-	}
-	if b.Len() == 0 {
-		return "job"
-	}
-	return b.String()
-}
+// ─── main ─────────────────────────────────────────────────────────────────────
 
 func main() {
-	browserPath, browserName := findBrowser()
+	cfg := parseConfig()
+
+	browserPath := cfg.Browser
+	var browserName string
 	if browserPath == "" {
-		log.Fatal("No Chromium-based browser found. Install Chrome, Edge, or Brave.")
+		browserPath, browserName = findBrowser()
+		if browserPath == "" {
+			log.Fatal("No Chromium-based browser found. Install Chrome, Edge, or Brave, or pass -browser=<path>")
+		}
+	} else {
+		browserName = "custom"
 	}
 	log.Printf("Using browser: %s (%s)", browserName, browserPath)
 
-	captureExtensionDir, err := ensureCaptureExtension()
+	captureExtensionDir, err := ensureCaptureExtension(cfg.Port)
 	if err != nil {
 		log.Fatalf("Failed to prepare capture extension: %v", err)
 	}
-	log.Printf("Capture extension loaded from %s", captureExtensionDir)
+	log.Printf("Capture extension ready at %s", captureExtensionDir)
+
+	opts := buildAllocatorOptions(browserPath, captureExtensionDir, cfg)
+	bm := newBrowserManager(browserPath, browserName, opts)
 
 	captureHub := newExtensionCaptureHub()
 	jobHub := newExtensionJobHub()
+	pool := newTabPool(bm)
+	bm.pool = pool
 
-	opts := append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.ExecPath(browserPath),
-		chromedp.NoFirstRun,
-		chromedp.NoDefaultBrowserCheck,
-		// chromedp.Headless, // Commented out for visual debugging; re-enable for production
-		chromedp.Flag("headless", false), // Explicitly override the default headless=true
-		chromedp.DisableGPU,
-		chromedp.Flag("no-sandbox", true),
-		chromedp.Flag("disable-dev-shm-usage", true),
-		chromedp.Flag("disable-extensions", false),
-		chromedp.Flag("disable-extensions-except", captureExtensionDir),
-		chromedp.Flag("load-extension", captureExtensionDir),
-		chromedp.Flag("disable-plugins", true),
-		// NOTE: "disable-images" and "disable-background-networking" are intentionally
-		// omitted; they suppress the network events we need for m3u8 capture.
-		chromedp.Flag("disable-sync", true),
-		chromedp.Flag("disable-translate", true),
-		chromedp.Flag("disable-default-apps", true),
-		chromedp.Flag("mute-audio", true),
-		chromedp.Flag("no-default-browser-check", true),
-		chromedp.Flag("metrics-recording-only", true),
-		chromedp.Flag("safebrowsing-disable-auto-update", true),
-		chromedp.Flag("js-flags", "--max-old-space-size=128"),
-	)
-
-	allocCtx, allocCancel := chromedp.NewExecAllocator(context.Background(), opts...)
-	defer allocCancel()
-
-	sem := semaphore.NewWeighted(maxConcurrentTabs)
+	sem := semaphore.NewWeighted(int64(cfg.MaxTabs))
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/execute", handleExecute(allocCtx, sem, captureHub, jobHub, browserPath, captureExtensionDir))
-	mux.HandleFunc("/extension-command", handleExtensionCommand(jobHub))
-	mux.HandleFunc("/extension-capture", handleExtensionCapture(captureHub))
-	mux.HandleFunc("/extension-result", handleExtensionResult(jobHub))
-	mux.HandleFunc("/health", handleHealth)
 
+	// ── One-shot scrape (backward-compatible) ──
+	mux.HandleFunc("POST /execute", handleExecute(bm, sem, cfg, captureHub, jobHub, browserPath, captureExtensionDir))
+
+	// ── Persistent tab control ──
+	mux.HandleFunc("GET /tabs", handleTabList(pool))
+	mux.HandleFunc("POST /tabs", handleTabCreate(pool))
+	mux.HandleFunc("GET /tabs/{id}", handleTabGet(pool))
+	mux.HandleFunc("DELETE /tabs/{id}", handleTabClose(pool))
+	mux.HandleFunc("POST /tabs/{id}/navigate", handleTabNavigate(pool))
+	mux.HandleFunc("POST /tabs/{id}/actions", handleTabActions(pool))
+	mux.HandleFunc("GET /tabs/{id}/snapshot", handleTabSnapshot(pool))
+	mux.HandleFunc("POST /tabs/{id}/evaluate", handleTabEvaluate(pool))
+	mux.HandleFunc("DELETE /tabs/{id}/urls", handleTabClearURLs(pool))
+
+	// ── Browser control ──
+	mux.HandleFunc("GET /browser", handleBrowserStatus(bm))
+	mux.HandleFunc("POST /browser/restart", handleBrowserRestart(bm))
+
+	// ── Config ──
+	mux.HandleFunc("GET /config", handleConfigGet(cfg, browserPath, browserName))
+
+	// ── Extension bridge (internal; used by the injected extension) ──
+	mux.HandleFunc("GET /extension-command", handleExtensionCommand(jobHub))
+	mux.HandleFunc("POST /extension-capture", handleExtensionCapture(captureHub))
+	mux.HandleFunc("POST /extension-result", handleExtensionResult(jobHub))
+
+	// ── Misc ──
+	mux.HandleFunc("GET /health", handleHealth)
+
+	timeout := cfg.Timeout
 	srv := &http.Server{
-		Addr:         serverAddr,
+		Addr:         cfg.Port,
 		Handler:      withCORS(withLogging(mux)),
 		ReadTimeout:  10 * time.Second,
-		WriteTimeout: requestTimeout + 5*time.Second,
+		WriteTimeout: timeout + 5*time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
 
@@ -631,31 +534,224 @@ func main() {
 
 	startParentWatchdog(shutdown)
 
-	fmt.Printf("Shadoware active on http://localhost%s (parent PID: %d)\n", serverAddr, os.Getppid())
+	fmt.Printf("Shadoware active on http://localhost%s  (parent PID: %d)\n", cfg.Port, os.Getppid())
+	fmt.Printf("Mode: %s | Headless: %v | MaxTabs: %d | Timeout: %s\n",
+		cfg.Mode, cfg.Headless, cfg.MaxTabs, cfg.Timeout)
 	if err := srv.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("Server error: %v", err)
 	}
 }
 
-func handleExecute(allocCtx context.Context, sem *semaphore.Weighted, captureHub *extensionCaptureHub, jobHub *extensionJobHub, browserPath, extensionDir string) http.HandlerFunc {
+func buildAllocatorOptions(browserPath, extensionDir string, cfg Config) []chromedp.ExecAllocatorOption {
+	opts := append(chromedp.DefaultExecAllocatorOptions[:],
+		chromedp.ExecPath(browserPath),
+		chromedp.NoFirstRun,
+		chromedp.NoDefaultBrowserCheck,
+		chromedp.DisableGPU,
+		chromedp.Flag("no-sandbox", true),
+		chromedp.Flag("disable-dev-shm-usage", true),
+		chromedp.Flag("disable-extensions", false),
+		chromedp.Flag("disable-extensions-except", extensionDir),
+		chromedp.Flag("load-extension", extensionDir),
+		chromedp.Flag("disable-plugins", true),
+		chromedp.Flag("disable-sync", true),
+		chromedp.Flag("disable-translate", true),
+		chromedp.Flag("disable-default-apps", true),
+		chromedp.Flag("mute-audio", true),
+		chromedp.Flag("no-default-browser-check", true),
+		chromedp.Flag("metrics-recording-only", true),
+		chromedp.Flag("safebrowsing-disable-auto-update", true),
+		chromedp.Flag("js-flags", "--max-old-space-size=128"),
+		chromedp.Flag("disable-blink-features", "AutomationControlled"),
+	)
+	if cfg.Headless {
+		opts = append(opts, chromedp.Flag("headless", true))
+	} else {
+		opts = append(opts, chromedp.Flag("headless", false))
+	}
+	return opts
+}
+
+// ─── Tab HTTP handlers ────────────────────────────────────────────────────────
+
+func handleTabList(pool *TabPool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, pool.List())
+	}
+}
+
+func handleTabCreate(pool *TabPool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			URL string `json:"url"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.URL == "" {
+			writeError(w, "url is required", http.StatusBadRequest)
+			return
+		}
+		tab, err := pool.Open(req.URL)
+		if err != nil {
+			writeError(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusCreated, tab.info())
+	}
+}
+
+func handleTabGet(pool *TabPool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		t, ok := pool.Get(r.PathValue("id"))
+		if !ok {
+			writeError(w, "tab not found", http.StatusNotFound)
+			return
+		}
+		writeJSON(w, http.StatusOK, t.info())
+	}
+}
+
+func handleTabClose(pool *TabPool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !pool.Close(r.PathValue("id")) {
+			writeError(w, "tab not found", http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+func handleTabNavigate(pool *TabPool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			URL string `json:"url"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.URL == "" {
+			writeError(w, "url is required", http.StatusBadRequest)
+			return
+		}
+		if err := pool.Navigate(r.PathValue("id"), req.URL); err != nil {
+			writeError(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		t, _ := pool.Get(r.PathValue("id"))
+		writeJSON(w, http.StatusOK, t.info())
+	}
+}
+
+func handleTabActions(pool *TabPool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Actions []BrowserAction `json:"actions"`
+			WaitMs  int             `json:"wait_ms"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		html, err := pool.RunActions(r.PathValue("id"), req.Actions, req.WaitMs)
+		if err != nil {
+			writeError(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"content": html})
+	}
+}
+
+func handleTabSnapshot(pool *TabPool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		html, m3u8s, urls, err := pool.Snapshot(r.PathValue("id"))
+		if err != nil {
+			writeError(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, TaskResponse{
+			Content:  html,
+			M3u8URLs: m3u8s,
+			AllURLs:  urls,
+		})
+	}
+}
+
+func handleTabEvaluate(pool *TabPool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Script string `json:"script"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Script) == "" {
+			writeError(w, "script is required", http.StatusBadRequest)
+			return
+		}
+		result, err := pool.Evaluate(r.PathValue("id"), req.Script)
+		if err != nil {
+			writeError(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"result": result})
+	}
+}
+
+func handleTabClearURLs(pool *TabPool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !pool.ClearURLs(r.PathValue("id")) {
+			writeError(w, "tab not found", http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+// ─── Browser HTTP handlers ────────────────────────────────────────────────────
+
+func handleBrowserStatus(bm *BrowserManager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, bm.Status())
+	}
+}
+
+func handleBrowserRestart(bm *BrowserManager) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		bm.Restart()
+		writeJSON(w, http.StatusOK, map[string]string{"status": "restarted"})
+	}
+}
+
+func handleConfigGet(cfg Config, browserPath, browserName string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"port":         cfg.Port,
+			"headless":     cfg.Headless,
+			"max_tabs":     cfg.MaxTabs,
+			"timeout":      cfg.Timeout.String(),
+			"mode":         cfg.Mode,
+			"browser_name": browserName,
+			"browser_path": browserPath,
+		})
+	}
+}
+
+// ─── One-shot execute handler ─────────────────────────────────────────────────
+
+func handleExecute(bm *BrowserManager, sem *semaphore.Weighted, cfg Config, captureHub *extensionCaptureHub, jobHub *extensionJobHub, browserPath, extensionDir string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeError(w, "Only POST allowed", http.StatusMethodNotAllowed)
 			return
 		}
-
 		var req TaskRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeError(w, "Invalid JSON: "+err.Error(), http.StatusBadRequest)
 			return
 		}
-
 		if err := validateRequest(req); err != nil {
 			writeError(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		// Per-request mode overrides the server default.
+		mode := strings.ToLower(req.Mode)
+		if mode == "" {
+			mode = cfg.Mode
+		}
 
-		ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+		ctx, cancel := context.WithTimeout(r.Context(), cfg.Timeout)
 		defer cancel()
 
 		if !sem.TryAcquire(1) {
@@ -665,7 +761,7 @@ func handleExecute(allocCtx context.Context, sem *semaphore.Weighted, captureHub
 		defer sem.Release(1)
 
 		if req.Stream {
-			handleExecuteStream(w, r, ctx, allocCtx, req, captureHub, jobHub, browserPath, extensionDir)
+			handleExecuteStream(w, r, ctx, bm.AllocCtx(), req, mode, captureHub, jobHub, browserPath, extensionDir)
 			return
 		}
 
@@ -675,8 +771,8 @@ func handleExecute(allocCtx context.Context, sem *semaphore.Weighted, captureHub
 			allURLs []string
 			err     error
 		)
-		if strings.EqualFold(req.Mode, "cdp") {
-			content, m3u8s, allURLs, err = scrapeCDP(ctx, allocCtx, req, captureHub, nil)
+		if mode == "cdp" {
+			content, m3u8s, allURLs, err = scrapeCDP(ctx, bm.AllocCtx(), req, captureHub, nil)
 		} else {
 			content, m3u8s, allURLs, err = scrapeExtension(ctx, req, captureHub, jobHub, browserPath, extensionDir, nil)
 		}
@@ -691,9 +787,7 @@ func handleExecute(allocCtx context.Context, sem *semaphore.Weighted, captureHub
 		if err != nil {
 			resp.Error = err.Error()
 		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(resp)
+		writeJSON(w, http.StatusOK, resp)
 	}
 }
 
@@ -704,13 +798,12 @@ type scrapeResult struct {
 	err     error
 }
 
-func handleExecuteStream(w http.ResponseWriter, r *http.Request, ctx context.Context, allocCtx context.Context, req TaskRequest, captureHub *extensionCaptureHub, jobHub *extensionJobHub, browserPath, extensionDir string) {
+func handleExecuteStream(w http.ResponseWriter, r *http.Request, ctx context.Context, allocCtx context.Context, req TaskRequest, mode string, captureHub *extensionCaptureHub, jobHub *extensionJobHub, browserPath, extensionDir string) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		writeError(w, "streaming is not supported by this server", http.StatusInternalServerError)
+		writeError(w, "streaming not supported", http.StatusInternalServerError)
 		return
 	}
-
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
@@ -726,7 +819,7 @@ func handleExecuteStream(w http.ResponseWriter, r *http.Request, ctx context.Con
 
 	go func() {
 		var res scrapeResult
-		if strings.EqualFold(req.Mode, "cdp") {
+		if mode == "cdp" {
 			res.content, res.m3u8s, res.allURLs, res.err = scrapeCDP(ctx, allocCtx, req, captureHub, emit)
 		} else {
 			res.content, res.m3u8s, res.allURLs, res.err = scrapeExtension(ctx, req, captureHub, jobHub, browserPath, extensionDir, emit)
@@ -776,56 +869,183 @@ func handleExecuteStream(w http.ResponseWriter, r *http.Request, ctx context.Con
 	}
 }
 
-func handleExtensionCapture(captureHub *extensionCaptureHub) http.HandlerFunc {
+// ─── Extension bridge ─────────────────────────────────────────────────────────
+
+type extensionCaptureEvent struct {
+	JobID     string `json:"job_id,omitempty"`
+	URL       string `json:"url"`
+	TabID     int    `json:"tab_id"`
+	FrameID   int    `json:"frame_id"`
+	RequestID string `json:"request_id"`
+	Type      string `json:"type"`
+	Initiator string `json:"initiator,omitempty"`
+}
+
+type extensionCaptureSession struct {
+	jobID    string
+	startURL string
+	hasTabID bool
+	tabID    int
+	trackURL func(string)
+}
+
+type extensionCaptureHub struct {
+	mu       sync.Mutex
+	sessions map[*extensionCaptureSession]struct{}
+}
+
+type extensionJob struct {
+	JobID        string            `json:"job_id"`
+	URL          string            `json:"url"`
+	WaitMs       int               `json:"wait_ms"`
+	LocalStorage map[string]string `json:"local_storage,omitempty"`
+	Actions      []BrowserAction   `json:"actions,omitempty"`
+	CloseTab     bool              `json:"close_tab"`
+}
+
+type extensionJobResult struct {
+	JobID   string `json:"job_id"`
+	Content string `json:"content"`
+	Error   string `json:"error,omitempty"`
+}
+
+type extensionJobHub struct {
+	mu      sync.Mutex
+	queue   []*extensionJob
+	results map[string]chan extensionJobResult
+}
+
+func newExtensionCaptureHub() *extensionCaptureHub {
+	return &extensionCaptureHub{sessions: make(map[*extensionCaptureSession]struct{})}
+}
+
+func newExtensionJobHub() *extensionJobHub {
+	return &extensionJobHub{results: make(map[string]chan extensionJobResult)}
+}
+
+func (h *extensionJobHub) enqueue(job *extensionJob) <-chan extensionJobResult {
+	ch := make(chan extensionJobResult, 1)
+	h.mu.Lock()
+	h.queue = append(h.queue, job)
+	h.results[job.JobID] = ch
+	h.mu.Unlock()
+	return ch
+}
+
+func (h *extensionJobHub) next() (*extensionJob, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.queue) == 0 {
+		return nil, false
+	}
+	job := h.queue[0]
+	h.queue = h.queue[1:]
+	return job, true
+}
+
+func (h *extensionJobHub) complete(result extensionJobResult) bool {
+	h.mu.Lock()
+	ch := h.results[result.JobID]
+	delete(h.results, result.JobID)
+	h.mu.Unlock()
+	if ch == nil {
+		return false
+	}
+	ch <- result
+	return true
+}
+
+func (h *extensionCaptureHub) register(jobID, startURL string, trackURL func(string)) func() {
+	s := &extensionCaptureSession{
+		jobID:    jobID,
+		startURL: normalizeCapturedURL(startURL, ""),
+		trackURL: trackURL,
+	}
+	h.mu.Lock()
+	h.sessions[s] = struct{}{}
+	h.mu.Unlock()
+	return func() {
+		h.mu.Lock()
+		delete(h.sessions, s)
+		h.mu.Unlock()
+	}
+}
+
+func (h *extensionCaptureHub) capture(ev extensionCaptureEvent) {
+	if ev.URL == "" || ev.TabID < 0 {
+		return
+	}
+	normalized := normalizeCapturedURL(ev.URL, "")
+	var trackers []func(string)
+	h.mu.Lock()
+	for s := range h.sessions {
+		if s.jobID != "" {
+			if s.jobID == ev.JobID {
+				trackers = append(trackers, s.trackURL)
+			}
+			continue
+		}
+		if s.hasTabID {
+			if s.tabID == ev.TabID {
+				trackers = append(trackers, s.trackURL)
+			}
+			continue
+		}
+		if ev.Type == "main_frame" && sameCapturedURL(normalized, s.startURL) {
+			s.hasTabID = true
+			s.tabID = ev.TabID
+			trackers = append(trackers, s.trackURL)
+		}
+	}
+	h.mu.Unlock()
+	for _, fn := range trackers {
+		fn(ev.URL)
+	}
+}
+
+func handleExtensionCapture(hub *extensionCaptureHub) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-
 		var ev extensionCaptureEvent
 		if err := json.NewDecoder(r.Body).Decode(&ev); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-
-		captureHub.capture(ev)
+		hub.capture(ev)
 		w.WriteHeader(http.StatusNoContent)
 	}
 }
 
-func handleExtensionCommand(jobHub *extensionJobHub) http.HandlerFunc {
+func handleExtensionCommand(hub *extensionJobHub) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-
-		job, ok := jobHub.next()
+		job, ok := hub.next()
 		if !ok {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(job)
+		writeJSON(w, http.StatusOK, job)
 	}
 }
 
-func handleExtensionResult(jobHub *extensionJobHub) http.HandlerFunc {
+func handleExtensionResult(hub *extensionJobHub) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-
 		var result extensionJobResult
 		if err := json.NewDecoder(r.Body).Decode(&result); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
-
-		if !jobHub.complete(result) {
+		if !hub.complete(result) {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
@@ -833,160 +1053,187 @@ func handleExtensionResult(jobHub *extensionJobHub) http.HandlerFunc {
 	}
 }
 
-// stealthScript patches the properties that anti-bot scripts check before our
-// page JS runs. Covers the most common detection vectors.
-const stealthScript = `
-(function () {
-	// 1. Remove the webdriver flag entirely.
-	Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+// ─── Extension browser ────────────────────────────────────────────────────────
 
-	// 2. Restore window.chrome so sites think it's a real Chrome/Edge install.
-	window.chrome = { runtime: {} };
-
-	// 3. Make navigator.plugins non-empty (headless has 0 plugins).
-	Object.defineProperty(navigator, 'plugins', {
-		get: () => [1, 2, 3, 4, 5],
-	});
-
-	// 4. Realistic language list.
-	Object.defineProperty(navigator, 'languages', {
-		get: () => ['en-US', 'en'],
-	});
-
-	// 5. Fix permission query - automation returns 'denied' for notifications by default.
-	const origQuery = window.navigator.permissions.query;
-	window.navigator.permissions.query = (parameters) =>
-		parameters.name === 'notifications'
-			? Promise.resolve({ state: Notification.permission })
-			: origQuery(parameters);
-})();
-`
-
-const maxResponseBodyScanBytes = 2 * 1024 * 1024
-
-var mediaURLPattern = regexp.MustCompile(`(?i)[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*(?:\.m3u8|m3u8|\.mpd|/playlist|/master|manifest)[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*`)
-
-type responseMeta struct {
-	url               string
-	resourceType      network.ResourceType
-	mime              string
-	encodedDataLength float64
+type extensionBrowserProcess struct {
+	cmd        *exec.Cmd
+	profileDir string
 }
 
-type responseBodyJob struct {
-	ctx       context.Context
-	requestID network.RequestID
-	baseURL   string
-}
-
-type responseBodyScanner struct {
-	mu        sync.Mutex
-	responses map[network.RequestID]responseMeta
-	jobs      []responseBodyJob
-}
-
-func newResponseBodyScanner() *responseBodyScanner {
-	return &responseBodyScanner{
-		responses: make(map[network.RequestID]responseMeta),
+func ensureCaptureExtension(serverAddr string) (string, error) {
+	dir := filepath.Join(os.TempDir(), "shadoware-capture-extension")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return "", err
 	}
+	apiBase := "http://127.0.0.1" + serverAddr
+	manifest := `{
+  "manifest_version": 3,
+  "name": "ShadoWare Capture",
+  "version": "1.0.0",
+  "permissions": ["webRequest", "tabs", "scripting"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js" }
+}`
+	background := fmt.Sprintf(`const API_BASE = %q;
+const CAPTURE = API_BASE + "/extension-capture";
+const COMMAND = API_BASE + "/extension-command";
+const RESULT  = API_BASE + "/extension-result";
+const tabJobs = new Map();
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function post(url, body) {
+  await fetch(url, { method: "POST", headers: {"Content-Type":"application/json"}, body: JSON.stringify(body) });
 }
 
-func (s *responseBodyScanner) listen(ctx context.Context, trackURL func(string), trackText func(string, string)) func(interface{}) {
-	return func(ev interface{}) {
-		switch e := ev.(type) {
-		case *network.EventRequestWillBeSent:
-			if e.Request != nil {
-				trackURL(e.Request.URL)
-				s.remember(e.RequestID, responseMeta{
-					url:          e.Request.URL,
-					resourceType: e.Type,
-				})
-			}
-			if e.RedirectResponse != nil {
-				trackURL(e.RedirectResponse.URL)
-			}
-			if e.Initiator != nil {
-				trackURL(e.Initiator.URL)
-			}
-		case *network.EventResponseReceived:
-			if e.Response == nil {
-				return
-			}
-			trackURL(e.Response.URL)
-			for _, header := range e.Response.Headers {
-				if value, ok := header.(string); ok {
-					trackText(value, e.Response.URL)
-				}
-			}
-			s.remember(e.RequestID, responseMeta{
-				url:          e.Response.URL,
-				resourceType: e.Type,
-				mime:         e.Response.MimeType,
-			})
-		case *network.EventLoadingFinished:
-			s.finish(ctx, e.RequestID, e.EncodedDataLength)
-		case *network.EventWebSocketCreated:
-			trackURL(e.URL)
-		case *network.EventWebSocketFrameReceived:
-			if e.Response != nil {
-				trackText(e.Response.PayloadData, "")
-			}
-		case *network.EventWebSocketFrameSent:
-			if e.Response != nil {
-				trackText(e.Response.PayloadData, "")
-			}
-		case *network.EventWebTransportCreated:
-			trackURL(e.URL)
+chrome.webRequest.onBeforeRequest.addListener((d) => {
+  if (!d.url || d.url.startsWith(CAPTURE)) return;
+  const jobId = tabJobs.get(d.tabId);
+  if (!jobId) return;
+  post(CAPTURE, { job_id: jobId, url: d.url, tab_id: d.tabId, frame_id: d.frameId,
+                  request_id: d.requestId, type: d.type, initiator: d.initiator||"" }).catch(()=>{});
+}, { urls: ["<all_urls>"] });
+
+function waitComplete(tabId, ms=30000) {
+  return new Promise(resolve => {
+    let done=false;
+    const finish=()=>{ if(done)return; done=true; chrome.tabs.onUpdated.removeListener(l); resolve(); };
+    const l=(id,i)=>{ if(id===tabId&&i.status==="complete") finish(); };
+    chrome.tabs.onUpdated.addListener(l);
+    chrome.tabs.get(tabId).then(t=>{ if(t.status==="complete") finish(); }).catch(finish);
+    setTimeout(finish, ms);
+  });
+}
+
+async function runAction(tabId, a) {
+  const type = (a.type||"").toLowerCase();
+  if (type==="wait"||type==="sleep") { await sleep(a.wait_ms||0); return; }
+  if (type==="wait_ready") {
+    await chrome.scripting.executeScript({ target:{tabId}, args:[a.selector,a.wait_ms||10000],
+      func:(sel,ms)=>{ const s=Date.now(); return new Promise(r=>{ const i=setInterval(()=>{ if(document.querySelector(sel)||Date.now()-s>ms){clearInterval(i);r();} },100); }); } });
+    return;
+  }
+  if (type==="click"||type==="double_click") {
+    await chrome.scripting.executeScript({ target:{tabId}, args:[a.selector||"",a.x||0,a.y||0,type==="double_click"],
+      func:(sel,x,y,dbl)=>{ const el=sel?document.querySelector(sel):document.elementFromPoint(x,y); if(!el)return;
+        ["mousedown","mouseup","click"].forEach(n=>el.dispatchEvent(new MouseEvent(n,{bubbles:true,cancelable:true,view:window})));
+        if(dbl) el.dispatchEvent(new MouseEvent("dblclick",{bubbles:true,cancelable:true,view:window})); } });
+    return;
+  }
+  if (type==="scroll") {
+    await chrome.scripting.executeScript({ target:{tabId}, args:[a.delta_x||0,a.delta_y||0],
+      func:(dx,dy)=>window.scrollBy(dx,dy) });
+    return;
+  }
+  if (type==="send_keys"||type==="type") {
+    await chrome.scripting.executeScript({ target:{tabId}, args:[a.selector,a.text||""],
+      func:(sel,txt)=>{ const el=document.querySelector(sel); if(!el)return; el.focus(); el.value=txt;
+        el.dispatchEvent(new Event("input",{bubbles:true})); el.dispatchEvent(new Event("change",{bubbles:true})); } });
+    return;
+  }
+  if (type==="evaluate"||type==="eval") {
+    await chrome.scripting.executeScript({ target:{tabId}, args:[a.script||""], world:"MAIN",
+      func:(s)=>(0,eval)(s) });
+  }
+}
+
+async function runJob(job) {
+  let tab;
+  try {
+    tab = await chrome.tabs.create({ url: job.url, active: true });
+    tabJobs.set(tab.id, job.job_id);
+    await waitComplete(tab.id);
+    if (job.local_storage && Object.keys(job.local_storage).length) {
+      await chrome.scripting.executeScript({ target:{tabId:tab.id}, args:[job.local_storage],
+        func:(items)=>{ for(const[k,v] of Object.entries(items)) localStorage.setItem(k,v); } });
+      await chrome.tabs.reload(tab.id);
+      await waitComplete(tab.id);
+    }
+    for (const action of job.actions||[]) await runAction(tab.id, action);
+    if (job.wait_ms) await sleep(job.wait_ms);
+    const frames = await chrome.scripting.executeScript({ target:{tabId:tab.id,allFrames:true},
+      func:()=>document.documentElement.outerHTML });
+    const content = frames.map(f=>f.result||"").join("\n");
+    await post(RESULT, { job_id: job.job_id, content });
+  } catch(e) {
+    await post(RESULT, { job_id: job.job_id, content: "", error: e&&e.message?e.message:String(e) }).catch(()=>{});
+  } finally {
+    if (tab&&tab.id!==undefined) {
+      tabJobs.delete(tab.id);
+      if (job.close_tab!==false) chrome.tabs.remove(tab.id).catch(()=>{});
+    }
+  }
+}
+
+async function poll() {
+  for(;;) {
+    try {
+      const r = await fetch(COMMAND);
+      if (r.status===200) await runJob(await r.json());
+      else await sleep(500);
+    } catch(_) { await sleep(1000); }
+  }
+}
+poll();
+`, apiBase)
+
+	if err := os.WriteFile(filepath.Join(dir, "manifest.json"), []byte(manifest), 0644); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(filepath.Join(dir, "background.js"), []byte(background), 0644); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
+func launchExtensionBrowser(browserPath, extensionDir, jobID string) (*extensionBrowserProcess, error) {
+	profileDir, err := os.MkdirTemp("", "shadoware-profile-"+safeFilePart(jobID)+"-")
+	if err != nil {
+		return nil, err
+	}
+	args := []string{
+		"--user-data-dir=" + profileDir,
+		"--headless=new",
+		"--no-first-run",
+		"--no-default-browser-check",
+		"--disable-gpu",
+		"--disable-blink-features=AutomationControlled",
+		"--disable-extensions-except=" + extensionDir,
+		"--load-extension=" + extensionDir,
+		"--window-size=1365,768",
+		"--mute-audio",
+		"about:blank",
+	}
+	cmd := exec.Command(browserPath, args...)
+	if err := cmd.Start(); err != nil {
+		_ = os.RemoveAll(profileDir)
+		return nil, err
+	}
+	return &extensionBrowserProcess{cmd: cmd, profileDir: profileDir}, nil
+}
+
+func closeExtensionBrowser(b *extensionBrowserProcess) {
+	if b == nil {
+		return
+	}
+	if b.cmd != nil && b.cmd.Process != nil {
+		if runtime.GOOS == "windows" {
+			_ = exec.Command("taskkill", "/PID", strconv.Itoa(b.cmd.Process.Pid), "/T", "/F").Run()
+		} else {
+			_ = b.cmd.Process.Kill()
+		}
+		done := make(chan struct{})
+		go func() { _ = b.cmd.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
 		}
 	}
+	if b.profileDir != "" && strings.HasPrefix(filepath.Base(b.profileDir), "shadoware-profile-") {
+		_ = os.RemoveAll(b.profileDir)
+	}
 }
 
-func (s *responseBodyScanner) remember(requestID network.RequestID, meta responseMeta) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	existing := s.responses[requestID]
-	if meta.url != "" {
-		existing.url = meta.url
-	}
-	if meta.resourceType != "" {
-		existing.resourceType = meta.resourceType
-	}
-	if meta.mime != "" {
-		existing.mime = meta.mime
-	}
-	s.responses[requestID] = existing
-}
-
-func (s *responseBodyScanner) finish(ctx context.Context, requestID network.RequestID, encodedDataLength float64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	meta, ok := s.responses[requestID]
-	if !ok {
-		return
-	}
-	meta.encodedDataLength = encodedDataLength
-	delete(s.responses, requestID)
-
-	if !shouldInspectResponseBody(meta) {
-		return
-	}
-	s.jobs = append(s.jobs, responseBodyJob{
-		ctx:       ctx,
-		requestID: requestID,
-		baseURL:   meta.url,
-	})
-}
-
-func (s *responseBodyScanner) drain() []responseBodyJob {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	jobs := s.jobs
-	s.jobs = nil
-	return jobs
-}
+// ─── Scrape modes ─────────────────────────────────────────────────────────────
 
 func scrapeExtension(ctx context.Context, req TaskRequest, captureHub *extensionCaptureHub, jobHub *extensionJobHub, browserPath, extensionDir string, emit func(StreamEvent)) (string, []string, []string, error) {
 	var (
@@ -1018,14 +1265,18 @@ func scrapeExtension(ctx context.Context, req TaskRequest, captureHub *extension
 	}
 
 	jobID := fmt.Sprintf("%d-%d", time.Now().UnixNano(), nextExtensionJobID.Add(1))
+
 	browser, err := launchExtensionBrowser(browserPath, extensionDir, jobID)
 	if err != nil {
 		return "", nil, nil, err
 	}
 	defer closeExtensionBrowser(browser)
 
-	unregisterExtensionCapture := captureHub.register(jobID, req.URL, trackURL)
-	defer unregisterExtensionCapture()
+	// BUG FIX 2: give the browser's service worker time to start polling.
+	time.Sleep(1500 * time.Millisecond)
+
+	// BUG FIX 1: unregister AFTER trackText so the final HTML scan is captured.
+	unregister := captureHub.register(jobID, req.URL, trackURL)
 
 	resultCh := jobHub.enqueue(&extensionJob{
 		JobID:        jobID,
@@ -1040,28 +1291,29 @@ func scrapeExtension(ctx context.Context, req TaskRequest, captureHub *extension
 	select {
 	case result = <-resultCh:
 	case <-ctx.Done():
+		unregister()
 		return "", dedupe(m3u8URLs), dedupe(allURLs), ctx.Err()
 	}
 
+	// Scan the returned HTML for embedded URLs before unregistering.
 	trackText(result.Content, req.URL)
+	unregister() // FIX: called explicitly after trackText, not via defer
 
 	mu.Lock()
-	m3u8Snapshot := append([]string(nil), m3u8URLs...)
-	allSnapshot := append([]string(nil), allURLs...)
+	m3u8s := dedupe(append([]string(nil), m3u8URLs...))
+	all := dedupe(append([]string(nil), allURLs...))
 	mu.Unlock()
 
 	if result.Error != "" {
-		return result.Content, dedupe(m3u8Snapshot), dedupe(allSnapshot), errors.New(result.Error)
+		return result.Content, m3u8s, all, errors.New(result.Error)
 	}
-	return result.Content, dedupe(m3u8Snapshot), dedupe(allSnapshot), nil
+	return result.Content, m3u8s, all, nil
 }
 
 func scrapeCDP(ctx, allocCtx context.Context, req TaskRequest, captureHub *extensionCaptureHub, emit func(StreamEvent)) (string, []string, []string, error) {
-	// Apply the deadline first so the listener and Run share the exact same context.
 	tabCtx, tabCancel := chromedp.NewContext(allocCtx)
 	defer tabCancel()
-
-	tabCtx, deadlineCancel := context.WithTimeout(tabCtx, requestTimeout)
+	tabCtx, deadlineCancel := context.WithTimeout(tabCtx, 110*time.Second)
 	defer deadlineCancel()
 
 	var (
@@ -1071,7 +1323,6 @@ func scrapeCDP(ctx, allocCtx context.Context, req TaskRequest, captureHub *exten
 	)
 	bodyScanner := newResponseBodyScanner()
 
-	// trackURL is the shared URL capture function used by all targets.
 	trackURL := func(u string) {
 		u = normalizeCapturedURL(u, req.URL)
 		if u == "" {
@@ -1088,94 +1339,67 @@ func scrapeCDP(ctx, allocCtx context.Context, req TaskRequest, captureHub *exten
 			emit(StreamEvent{Type: "url", URL: u, IsMedia: isMedia})
 		}
 	}
-
 	trackText := func(text, baseURL string) {
 		for _, u := range extractCandidateURLs(text, baseURL) {
 			trackURL(u)
 		}
 	}
 
-	unregisterExtensionCapture := captureHub.register("", req.URL, trackURL)
-	defer unregisterExtensionCapture()
+	unregister := captureHub.register("", req.URL, trackURL)
+	defer unregister()
 
-	// attachNetworkListener creates a child context for a discovered target
-	// (iframe, popup, service worker) and starts capturing its network events.
-	var attachNetworkListener func(parentCtx context.Context, targetID target.ID)
-	attachNetworkListener = func(parentCtx context.Context, targetID target.ID) {
-		childCtx, _ := chromedp.NewContext(parentCtx,
-			chromedp.WithTargetID(targetID),
-		)
-		childNetworkHandler := bodyScanner.listen(childCtx, trackURL, trackText)
-		chromedp.ListenTarget(childCtx, func(ev interface{}) {
-			childNetworkHandler(ev)
-			switch e := ev.(type) {
-			case *target.EventAttachedToTarget:
-				go attachNetworkListener(childCtx, e.TargetInfo.TargetID)
+	var attachChild func(context.Context, target.ID)
+	attachChild = func(parent context.Context, tid target.ID) {
+		cctx, _ := chromedp.NewContext(parent, chromedp.WithTargetID(tid))
+		ch := bodyScanner.listen(cctx, trackURL, trackText)
+		chromedp.ListenTarget(cctx, func(ev interface{}) {
+			ch(ev)
+			if e, ok := ev.(*target.EventAttachedToTarget); ok {
+				go attachChild(cctx, e.TargetInfo.TargetID)
 			}
 		})
-		go chromedp.Run(childCtx,
+		go chromedp.Run(cctx,
 			target.SetAutoAttach(true, false).WithFlatten(true),
-			network.Enable().
-				WithMaxTotalBufferSize(100*1024*1024).
-				WithMaxResourceBufferSize(maxResponseBodyScanBytes).
-				WithMaxPostDataSize(1024*1024),
+			network.Enable().WithMaxTotalBufferSize(100*1024*1024).WithMaxResourceBufferSize(maxResponseBodyScanBytes),
 		)
 	}
 
-	// Main tab listener - handles network events and discovers child targets.
-	mainNetworkHandler := bodyScanner.listen(tabCtx, trackURL, trackText)
+	mainHandler := bodyScanner.listen(tabCtx, trackURL, trackText)
 	chromedp.ListenTarget(tabCtx, func(ev interface{}) {
-		mainNetworkHandler(ev)
-		switch e := ev.(type) {
-		case *target.EventAttachedToTarget:
+		mainHandler(ev)
+		if e, ok := ev.(*target.EventAttachedToTarget); ok {
 			t := string(e.TargetInfo.Type)
-			// Capture iframes, popups, AND service workers; all can fetch m3u8.
 			if t == "iframe" || t == "page" || t == "service_worker" || t == "worker" {
-				go attachNetworkListener(tabCtx, e.TargetInfo.TargetID)
+				go attachChild(tabCtx, e.TargetInfo.TargetID)
 			}
 		}
 	})
 
 	actions := []chromedp.Action{
-		// Flatten=true: child target (iframe) network events flow into the parent session.
 		target.SetAutoAttach(true, false).WithFlatten(true),
-		network.Enable().
-			WithMaxTotalBufferSize(100 * 1024 * 1024).
-			WithMaxResourceBufferSize(maxResponseBodyScanBytes).
-			WithMaxPostDataSize(1024 * 1024),
-		// Inject stealth patches before ANY page JS runs.
-		// This removes the webdriver flag and adds missing browser properties
-		// that anti-bot scripts check for.
+		network.Enable().WithMaxTotalBufferSize(100 * 1024 * 1024).WithMaxResourceBufferSize(maxResponseBodyScanBytes),
 		chromedp.ActionFunc(func(ctx context.Context) error {
 			_, err := page.AddScriptToEvaluateOnNewDocument(stealthScript).Do(ctx)
 			return err
 		}),
-
 		chromedp.Navigate(req.URL),
 	}
-
-	// Inject localStorage keys before the page runs its JS, then reload.
 	if len(req.LocalStorage) > 0 {
 		actions = append(actions, chromedp.ActionFunc(func(ctx context.Context) error {
 			for k, v := range req.LocalStorage {
 				km, _ := json.Marshal(k)
 				vm, _ := json.Marshal(v)
-				script := fmt.Sprintf("window.localStorage.setItem(%s, %s);", string(km), string(vm))
-				if err := chromedp.Evaluate(script, nil).Do(ctx); err != nil {
+				if err := chromedp.Evaluate(fmt.Sprintf("localStorage.setItem(%s,%s)", km, vm), nil).Do(ctx); err != nil {
 					return err
 				}
 			}
 			return nil
-		}))
-		actions = append(actions, chromedp.Reload())
+		}), chromedp.Reload())
 	}
-
 	var htmlContent string
-	actions = append(actions,
-		chromedp.WaitReady("body", chromedp.ByQuery),
-	)
-	for _, reqAction := range req.Actions {
-		actions = append(actions, buildBrowserAction(reqAction))
+	actions = append(actions, chromedp.WaitReady("body", chromedp.ByQuery))
+	for _, a := range req.Actions {
+		actions = append(actions, buildBrowserAction(a))
 	}
 	actions = append(actions,
 		chromedp.Sleep(time.Duration(req.WaitMs)*time.Millisecond),
@@ -1183,62 +1407,149 @@ func scrapeCDP(ctx, allocCtx context.Context, req TaskRequest, captureHub *exten
 	)
 
 	runErr := chromedp.Run(tabCtx, actions...)
-
 	trackText(htmlContent, req.URL)
 	scanResponseBodies(bodyScanner, trackText)
 
 	mu.Lock()
-	m3u8Snapshot := append([]string(nil), m3u8URLs...)
-	allSnapshot := append([]string(nil), allURLs...)
+	m3u8s := dedupe(append([]string(nil), m3u8URLs...))
+	all := dedupe(append([]string(nil), allURLs...))
 	mu.Unlock()
 
 	if runErr != nil {
-		return "", dedupe(m3u8Snapshot), dedupe(allSnapshot), fmt.Errorf("chromedp: %w", runErr)
+		return "", m3u8s, all, fmt.Errorf("chromedp: %w", runErr)
 	}
-
-	return htmlContent, dedupe(m3u8Snapshot), dedupe(allSnapshot), nil
+	return htmlContent, m3u8s, all, nil
 }
 
-func buildBrowserAction(action BrowserAction) chromedp.Action {
-	switch strings.ToLower(action.Type) {
-	case "wait", "sleep":
-		return chromedp.Sleep(time.Duration(action.WaitMs) * time.Millisecond)
-	case "click":
-		if action.Selector != "" {
-			return chromedp.Click(action.Selector, chromedp.ByQuery)
+// ─── Response body scanner ────────────────────────────────────────────────────
+
+type responseMeta struct {
+	url               string
+	resourceType      network.ResourceType
+	mime              string
+	encodedDataLength float64
+}
+
+type responseBodyJob struct {
+	ctx       context.Context
+	requestID network.RequestID
+	baseURL   string
+}
+
+type responseBodyScanner struct {
+	mu        sync.Mutex
+	responses map[network.RequestID]responseMeta
+	jobs      []responseBodyJob
+}
+
+func newResponseBodyScanner() *responseBodyScanner {
+	return &responseBodyScanner{responses: make(map[network.RequestID]responseMeta)}
+}
+
+func (s *responseBodyScanner) listen(ctx context.Context, trackURL func(string), trackText func(string, string)) func(interface{}) {
+	return func(ev interface{}) {
+		switch e := ev.(type) {
+		case *network.EventRequestWillBeSent:
+			if e.Request != nil {
+				trackURL(e.Request.URL)
+				s.remember(e.RequestID, responseMeta{url: e.Request.URL, resourceType: e.Type})
+			}
+			if e.RedirectResponse != nil {
+				trackURL(e.RedirectResponse.URL)
+			}
+			if e.Initiator != nil {
+				trackURL(e.Initiator.URL)
+			}
+		case *network.EventResponseReceived:
+			if e.Response == nil {
+				return
+			}
+			trackURL(e.Response.URL)
+			for _, h := range e.Response.Headers {
+				if v, ok := h.(string); ok {
+					trackText(v, e.Response.URL)
+				}
+			}
+			s.remember(e.RequestID, responseMeta{url: e.Response.URL, resourceType: e.Type, mime: e.Response.MimeType})
+		case *network.EventLoadingFinished:
+			s.finish(ctx, e.RequestID, e.EncodedDataLength)
+		case *network.EventWebSocketCreated:
+			trackURL(e.URL)
+		case *network.EventWebSocketFrameReceived:
+			if e.Response != nil {
+				trackText(e.Response.PayloadData, "")
+			}
+		case *network.EventWebTransportCreated:
+			trackURL(e.URL)
 		}
-		return chromedp.MouseClickXY(action.X, action.Y)
-	case "double_click":
-		if action.Selector != "" {
-			return chromedp.DoubleClick(action.Selector, chromedp.ByQuery)
-		}
-		return chromedp.MouseClickXY(action.X, action.Y, chromedp.ClickCount(2))
-	case "evaluate", "eval":
-		return chromedp.Evaluate(action.Script, nil)
-	case "scroll":
-		return chromedp.Evaluate(fmt.Sprintf(`window.scrollBy(%f, %f);`, action.DeltaX, action.DeltaY), nil)
-	case "send_keys", "type":
-		return chromedp.SendKeys(action.Selector, action.Text, chromedp.ByQuery)
-	case "wait_ready":
-		return chromedp.WaitReady(action.Selector, chromedp.ByQuery)
-	default:
-		return chromedp.ActionFunc(func(context.Context) error {
-			return fmt.Errorf("unsupported action type %q", action.Type)
-		})
 	}
 }
 
-// dedupe removes duplicate strings while preserving order.
-func dedupe(in []string) []string {
-	seen := make(map[string]struct{}, len(in))
-	out := in[:0]
-	for _, s := range in {
-		if _, ok := seen[s]; !ok {
-			seen[s] = struct{}{}
-			out = append(out, s)
+func (s *responseBodyScanner) remember(id network.RequestID, meta responseMeta) {
+	s.mu.Lock()
+	ex := s.responses[id]
+	if meta.url != "" {
+		ex.url = meta.url
+	}
+	if meta.resourceType != "" {
+		ex.resourceType = meta.resourceType
+	}
+	if meta.mime != "" {
+		ex.mime = meta.mime
+	}
+	s.responses[id] = ex
+	s.mu.Unlock()
+}
+
+func (s *responseBodyScanner) finish(ctx context.Context, id network.RequestID, size float64) {
+	s.mu.Lock()
+	meta, ok := s.responses[id]
+	if !ok {
+		s.mu.Unlock()
+		return
+	}
+	meta.encodedDataLength = size
+	delete(s.responses, id)
+	if !shouldInspectResponseBody(meta) {
+		s.mu.Unlock()
+		return
+	}
+	s.jobs = append(s.jobs, responseBodyJob{ctx: ctx, requestID: id, baseURL: meta.url})
+	s.mu.Unlock()
+}
+
+func (s *responseBodyScanner) drain() []responseBodyJob {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	jobs := s.jobs
+	s.jobs = nil
+	return jobs
+}
+
+func scanResponseBodies(scanner *responseBodyScanner, trackText func(string, string)) {
+	deadline := time.Now().Add(6 * time.Second)
+	for {
+		jobs := scanner.drain()
+		if len(jobs) == 0 || time.Now().After(deadline) {
+			return
+		}
+		for _, job := range jobs {
+			if time.Now().After(deadline) {
+				return
+			}
+			bctx, cancel := context.WithTimeout(job.ctx, time.Until(deadline))
+			var body []byte
+			err := chromedp.Run(bctx, chromedp.ActionFunc(func(ctx context.Context) error {
+				var e error
+				body, e = network.GetResponseBody(job.requestID).Do(ctx)
+				return e
+			}))
+			cancel()
+			if err == nil && len(body) > 0 {
+				trackText(string(body), job.baseURL)
+			}
 		}
 	}
-	return out
 }
 
 func shouldInspectResponseBody(meta responseMeta) bool {
@@ -1248,95 +1559,98 @@ func shouldInspectResponseBody(meta responseMeta) bool {
 	if meta.encodedDataLength > maxResponseBodyScanBytes {
 		return false
 	}
-
 	mime := strings.ToLower(meta.mime)
-	if strings.Contains(mime, "json") ||
-		strings.Contains(mime, "javascript") ||
-		strings.Contains(mime, "mpegurl") ||
-		strings.Contains(mime, "dash+xml") ||
-		strings.Contains(mime, "text") ||
-		strings.Contains(mime, "html") ||
-		strings.Contains(mime, "xml") {
+	if strings.ContainsAny(mime, "json,javascript,mpegurl,dash+xml,text,html,xml") {
 		return true
 	}
-
 	switch meta.resourceType {
-	case network.ResourceTypeDocument,
-		network.ResourceTypeScript,
-		network.ResourceTypeXHR,
-		network.ResourceTypeFetch,
-		network.ResourceTypeManifest,
-		network.ResourceTypeMedia:
+	case network.ResourceTypeDocument, network.ResourceTypeScript,
+		network.ResourceTypeXHR, network.ResourceTypeFetch,
+		network.ResourceTypeManifest, network.ResourceTypeMedia:
 		return true
-	default:
-		return false
 	}
+	return false
 }
 
-func scanResponseBodies(scanner *responseBodyScanner, trackText func(string, string)) {
-	deadline := time.Now().Add(6 * time.Second)
+// ─── Header probing ───────────────────────────────────────────────────────────
 
-	for {
-		jobs := scanner.drain()
-		if len(jobs) == 0 || time.Now().After(deadline) {
-			return
-		}
+// BUG FIX 3: use a real browser UA so CDNs don't 403 us.
+const browserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0"
 
-		for _, job := range jobs {
-			remaining := time.Until(deadline)
-			if remaining <= 0 {
-				return
-			}
-
-			bodyCtx, cancel := context.WithTimeout(job.ctx, remaining)
-			var body []byte
-			err := chromedp.Run(bodyCtx, chromedp.ActionFunc(func(ctx context.Context) error {
-				var err error
-				body, err = network.GetResponseBody(job.requestID).Do(ctx)
-				return err
-			}))
-			cancel()
-
-			if err == nil && len(body) > 0 {
-				trackText(string(body), job.baseURL)
+func collectM3U8Headers(ctx context.Context, mediaURLs []string) []CapturedURLHeader {
+	unique := dedupe(mediaURLs)
+	filtered := make([]string, 0, maxHeaderProbes)
+	for _, u := range unique {
+		if isM3U8URL(u) {
+			filtered = append(filtered, u)
+			if len(filtered) >= maxHeaderProbes {
+				break
 			}
 		}
 	}
-}
-
-func extractCandidateURLs(text, baseURL string) []string {
-	if text == "" {
+	if len(filtered) == 0 {
 		return nil
 	}
-
-	text = unescapeURLText(text)
-	matches := mediaURLPattern.FindAllString(text, -1)
-	if len(matches) == 0 {
-		return nil
-	}
-
-	out := make([]string, 0, len(matches))
-	for _, match := range matches {
-		u := normalizeCapturedURL(match, baseURL)
-		if u != "" {
-			out = append(out, u)
+	client := &http.Client{Timeout: headerProbeTimeout}
+	out := make([]CapturedURLHeader, 0, len(filtered))
+	for _, u := range filtered {
+		entry := CapturedURLHeader{URL: u}
+		status, method, headers, err := probeHeaders(ctx, client, u)
+		if err != nil {
+			entry.Error = err.Error()
+		} else {
+			entry.Status = status
+			entry.Method = method
+			entry.Headers = headers
 		}
+		out = append(out, entry)
 	}
-	return dedupe(out)
+	return out
 }
+
+func probeHeaders(ctx context.Context, client *http.Client, rawURL string) (int, string, map[string]string, error) {
+	do := func(method string) (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, method, rawURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("User-Agent", browserUA)
+		return client.Do(req)
+	}
+
+	if resp, err := do(http.MethodHead); err == nil && resp.StatusCode != http.StatusMethodNotAllowed && resp.StatusCode != http.StatusNotImplemented {
+		_ = resp.Body.Close()
+		return resp.StatusCode, http.MethodHead, flattenHeaders(resp.Header), nil
+	}
+
+	resp, err := do(http.MethodGet)
+	if err != nil {
+		return 0, http.MethodGet, nil, err
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode, http.MethodGet, flattenHeaders(resp.Header), nil
+}
+
+func flattenHeaders(in http.Header) map[string]string {
+	out := make(map[string]string, len(in))
+	for k, vs := range in {
+		out[k] = strings.Join(vs, ", ")
+	}
+	return out
+}
+
+// ─── URL utilities ────────────────────────────────────────────────────────────
 
 func normalizeCapturedURL(raw, baseURL string) string {
 	raw = strings.TrimSpace(unescapeURLText(raw))
 	if raw == "" {
 		return ""
 	}
-
 	raw = strings.Trim(raw, " \t\r\n\"'<>`),;")
 	raw = strings.TrimRight(raw, ".")
 	if raw == "" || raw == "about:blank" {
 		return ""
 	}
-
 	if strings.HasPrefix(raw, "//") {
 		if base, err := url.Parse(baseURL); err == nil && base.Scheme != "" {
 			raw = base.Scheme + ":" + raw
@@ -1344,14 +1658,12 @@ func normalizeCapturedURL(raw, baseURL string) string {
 			raw = "https:" + raw
 		}
 	}
-
 	parsed, err := url.Parse(raw)
 	if err != nil {
 		return raw
 	}
 	if parsed.Scheme == "" && baseURL != "" {
-		base, err := url.Parse(baseURL)
-		if err == nil {
+		if base, err := url.Parse(baseURL); err == nil {
 			parsed = base.ResolveReference(parsed)
 		}
 	}
@@ -1365,143 +1677,122 @@ func normalizeCapturedURL(raw, baseURL string) string {
 }
 
 func sameCapturedURL(a, b string) bool {
-	a = normalizeCapturedURL(a, "")
-	b = normalizeCapturedURL(b, "")
-	if a == "" || b == "" {
-		return false
-	}
-
-	parsedA, errA := url.Parse(a)
-	parsedB, errB := url.Parse(b)
-	if errA != nil || errB != nil {
+	pa, ea := url.Parse(a)
+	pb, eb := url.Parse(b)
+	if ea != nil || eb != nil {
 		return a == b
 	}
-
-	parsedA.Fragment = ""
-	parsedB.Fragment = ""
-	return strings.EqualFold(parsedA.Scheme, parsedB.Scheme) &&
-		strings.EqualFold(parsedA.Host, parsedB.Host) &&
-		parsedA.EscapedPath() == parsedB.EscapedPath() &&
-		parsedA.RawQuery == parsedB.RawQuery
+	pa.Fragment = ""
+	pb.Fragment = ""
+	return strings.EqualFold(pa.Scheme, pb.Scheme) &&
+		strings.EqualFold(pa.Host, pb.Host) &&
+		pa.EscapedPath() == pb.EscapedPath() &&
+		pa.RawQuery == pb.RawQuery
 }
 
 func unescapeURLText(text string) string {
-	replacer := strings.NewReplacer(
-		`\/`, "/",
-		`\u0026`, "&",
-		`\u002F`, "/",
-		`\u003d`, "=",
-		`\u003D`, "=",
-		`\u003f`, "?",
-		`\u003F`, "?",
-		`\u003a`, ":",
-		`\u003A`, ":",
+	return strings.NewReplacer(
+		`\/`, "/", `\u0026`, "&", `\u002F`, "/",
+		`\u003d`, "=", `\u003D`, "=", `\u003f`, "?",
+		`\u003F`, "?", `\u003a`, ":", `\u003A`, ":",
 		"&amp;", "&",
-	)
-	return replacer.Replace(text)
+	).Replace(text)
+}
+
+func extractCandidateURLs(text, baseURL string) []string {
+	if text == "" {
+		return nil
+	}
+	text = unescapeURLText(text)
+	matches := mediaURLPattern.FindAllString(text, -1)
+	out := make([]string, 0, len(matches))
+	for _, m := range matches {
+		if u := normalizeCapturedURL(m, baseURL); u != "" {
+			out = append(out, u)
+		}
+	}
+	return dedupe(out)
 }
 
 func isMediaCandidateURL(raw string) bool {
 	u := strings.ToLower(unescapeURLText(raw))
-	return strings.Contains(u, "m3u8") ||
-		strings.Contains(u, ".mpd") ||
-		strings.Contains(u, "/playlist") ||
-		strings.Contains(u, "/master") ||
-		strings.Contains(u, "manifest") ||
-		strings.Contains(u, ".mp4")
+	return strings.Contains(u, "m3u8") || strings.Contains(u, ".mpd") ||
+		strings.Contains(u, "/playlist") || strings.Contains(u, "/master") ||
+		strings.Contains(u, "manifest") || strings.Contains(u, ".mp4")
 }
 
 func isM3U8URL(raw string) bool {
 	return strings.Contains(strings.ToLower(unescapeURLText(raw)), ".m3u8")
 }
 
-func collectM3U8Headers(ctx context.Context, mediaURLs []string) []CapturedURLHeader {
-	unique := dedupe(mediaURLs)
-	filtered := make([]string, 0, len(unique))
-	for _, u := range unique {
-		if isM3U8URL(u) {
-			filtered = append(filtered, u)
-			if len(filtered) >= maxHeaderProbes {
-				break
-			}
+func dedupe(in []string) []string {
+	seen := make(map[string]struct{}, len(in))
+	out := in[:0]
+	for _, s := range in {
+		if _, ok := seen[s]; !ok {
+			seen[s] = struct{}{}
+			out = append(out, s)
 		}
-	}
-	if len(filtered) == 0 {
-		return nil
-	}
-
-	client := &http.Client{Timeout: headerProbeTimeout}
-	out := make([]CapturedURLHeader, 0, len(filtered))
-	for _, u := range filtered {
-		entry := CapturedURLHeader{URL: u}
-		status, method, headers, err := probeHeaders(ctx, client, u)
-		if err != nil {
-			entry.Error = err.Error()
-			out = append(out, entry)
-			continue
-		}
-
-		entry.Status = status
-		entry.Method = method
-		entry.Headers = headers
-		out = append(out, entry)
 	}
 	return out
 }
 
-func probeHeaders(ctx context.Context, client *http.Client, rawURL string) (int, string, map[string]string, error) {
-	headReq, err := http.NewRequestWithContext(ctx, http.MethodHead, rawURL, nil)
-	if err != nil {
-		return 0, "", nil, err
-	}
-	headReq.Header.Set("User-Agent", "ShadoWare/1.0")
+// ─── Browser action builder ───────────────────────────────────────────────────
 
-	headResp, err := client.Do(headReq)
-	if err == nil && headResp != nil {
-		headers := flattenHeaders(headResp.Header)
-		status := headResp.StatusCode
-		_ = headResp.Body.Close()
-		if status != http.StatusMethodNotAllowed && status != http.StatusNotImplemented {
-			return status, http.MethodHead, headers, nil
+func buildBrowserAction(a BrowserAction) chromedp.Action {
+	switch strings.ToLower(a.Type) {
+	case "wait", "sleep":
+		return chromedp.Sleep(time.Duration(a.WaitMs) * time.Millisecond)
+	case "click":
+		if a.Selector != "" {
+			return chromedp.Click(a.Selector, chromedp.ByQuery)
 		}
-	}
-
-	getReq, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
-	if err != nil {
-		return 0, "", nil, err
-	}
-	getReq.Header.Set("Range", "bytes=0-0")
-	getReq.Header.Set("User-Agent", "ShadoWare/1.0")
-
-	getResp, err := client.Do(getReq)
-	if err != nil {
-		if headResp != nil {
-			return 0, http.MethodHead, nil, err
+		return chromedp.MouseClickXY(a.X, a.Y)
+	case "double_click":
+		if a.Selector != "" {
+			return chromedp.DoubleClick(a.Selector, chromedp.ByQuery)
 		}
-		return 0, http.MethodGet, nil, err
+		return chromedp.MouseClickXY(a.X, a.Y, chromedp.ClickCount(2))
+	case "evaluate", "eval":
+		return chromedp.Evaluate(a.Script, nil)
+	case "scroll":
+		return chromedp.Evaluate(fmt.Sprintf("window.scrollBy(%f,%f)", a.DeltaX, a.DeltaY), nil)
+	case "send_keys", "type":
+		return chromedp.SendKeys(a.Selector, a.Text, chromedp.ByQuery)
+	case "wait_ready":
+		return chromedp.WaitReady(a.Selector, chromedp.ByQuery)
+	default:
+		return chromedp.ActionFunc(func(context.Context) error {
+			return fmt.Errorf("unsupported action type %q", a.Type)
+		})
 	}
-	defer getResp.Body.Close()
-
-	return getResp.StatusCode, http.MethodGet, flattenHeaders(getResp.Header), nil
 }
 
-func flattenHeaders(in http.Header) map[string]string {
-	out := make(map[string]string, len(in))
-	for k, values := range in {
-		out[k] = strings.Join(values, ", ")
-	}
-	return out
-}
+// ─── Stealth script ───────────────────────────────────────────────────────────
 
-// startParentWatchdog polls the parent process every 2 seconds.
-func startParentWatchdog(shutdown func(reason string)) {
+const stealthScript = `
+(function () {
+	Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+	window.chrome = { runtime: {} };
+	Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
+	Object.defineProperty(navigator, 'languages', { get: () => ['en-US','en'] });
+	const origQuery = window.navigator.permissions.query;
+	window.navigator.permissions.query = p =>
+		p.name === 'notifications'
+			? Promise.resolve({ state: Notification.permission })
+			: origQuery(p);
+})();
+`
+
+// ─── Watchdog, browser finder, validation, helpers ────────────────────────────
+
+func startParentWatchdog(shutdown func(string)) {
 	ppid := os.Getppid()
 	log.Printf("Watchdog: monitoring parent PID %d", ppid)
-
 	go func() {
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
-		for range ticker.C {
+		t := time.NewTicker(2 * time.Second)
+		defer t.Stop()
+		for range t.C {
 			if isParentDead(ppid) {
 				shutdown("parent process is gone")
 				return
@@ -1510,15 +1801,12 @@ func startParentWatchdog(shutdown func(reason string)) {
 	}()
 }
 
-// findBrowser scans common install paths for Edge, Brave, and Chrome.
 func findBrowser() (path, name string) {
 	type candidate struct {
 		name  string
 		paths []string
 	}
-
 	var browsers []candidate
-
 	switch runtime.GOOS {
 	case "windows":
 		browsers = []candidate{
@@ -1542,17 +1830,13 @@ func findBrowser() (path, name string) {
 			{"Brave", []string{"/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"}},
 			{"Google Chrome", []string{"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"}},
 		}
-	default: // Linux
+	default:
 		browsers = []candidate{
 			{"Microsoft Edge", []string{"/usr/bin/microsoft-edge", "/usr/bin/microsoft-edge-stable"}},
 			{"Brave", []string{"/usr/bin/brave-browser", "/usr/bin/brave"}},
-			{"Google Chrome", []string{
-				"/usr/bin/google-chrome", "/usr/bin/google-chrome-stable",
-				"/usr/bin/chromium", "/usr/bin/chromium-browser",
-			}},
+			{"Google Chrome", []string{"/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/usr/bin/chromium", "/usr/bin/chromium-browser"}},
 		}
 	}
-
 	for _, b := range browsers {
 		for _, p := range b.paths {
 			if _, err := os.Stat(p); err == nil {
@@ -1571,67 +1855,67 @@ func validateRequest(req TaskRequest) error {
 	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
 		return errors.New("url must be a valid http/https URL")
 	}
-	if req.WaitMs < 0 {
-		return errors.New("wait_ms must be non-negative")
+	if req.WaitMs < 0 || req.WaitMs > 15_000 {
+		return errors.New("wait_ms must be between 0 and 15000")
 	}
-	if req.WaitMs > 15_000 {
-		return errors.New("wait_ms cannot exceed 15000 (15 seconds)")
-	}
-	for i, action := range req.Actions {
-		if err := validateBrowserAction(action); err != nil {
+	for i, a := range req.Actions {
+		if err := validateBrowserAction(a); err != nil {
 			return fmt.Errorf("actions[%d]: %w", i, err)
 		}
 	}
 	return nil
 }
 
-func validateBrowserAction(action BrowserAction) error {
-	switch strings.ToLower(action.Type) {
+func validateBrowserAction(a BrowserAction) error {
+	switch strings.ToLower(a.Type) {
 	case "wait", "sleep":
-		if action.WaitMs < 0 || action.WaitMs > 30_000 {
-			return errors.New("wait_ms must be between 0 and 30000")
+		if a.WaitMs < 0 || a.WaitMs > 30_000 {
+			return errors.New("wait_ms must be 0–30000")
 		}
 	case "click", "double_click":
-		if action.Selector == "" && action.X == 0 && action.Y == 0 {
+		if a.Selector == "" && a.X == 0 && a.Y == 0 {
 			return errors.New("click requires selector or x/y")
 		}
 	case "evaluate", "eval":
-		if strings.TrimSpace(action.Script) == "" {
+		if strings.TrimSpace(a.Script) == "" {
 			return errors.New("evaluate requires script")
 		}
 	case "scroll":
-		if action.DeltaX == 0 && action.DeltaY == 0 {
+		if a.DeltaX == 0 && a.DeltaY == 0 {
 			return errors.New("scroll requires delta_x or delta_y")
 		}
 	case "send_keys", "type":
-		if action.Selector == "" {
+		if a.Selector == "" {
 			return errors.New("send_keys requires selector")
 		}
 	case "wait_ready":
-		if action.Selector == "" {
+		if a.Selector == "" {
 			return errors.New("wait_ready requires selector")
 		}
 	default:
-		return fmt.Errorf("unsupported type %q", action.Type)
+		return fmt.Errorf("unsupported action type %q", a.Type)
 	}
 	return nil
 }
 
 func handleHealth(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func writeJSON(w http.ResponseWriter, code int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(v)
 }
 
 func writeError(w http.ResponseWriter, msg string, code int) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(TaskResponse{Error: msg})
+	writeJSON(w, code, TaskResponse{Error: msg})
 }
 
 func withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -1643,11 +1927,34 @@ func withCORS(next http.Handler) http.Handler {
 
 func withLogging(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		next.ServeHTTP(w, r)
 		if strings.HasPrefix(r.URL.Path, "/extension-") {
+			next.ServeHTTP(w, r)
 			return
 		}
-		log.Printf("%s %s - %s", r.Method, r.URL.Path, time.Since(start))
+		start := time.Now()
+		next.ServeHTTP(w, r)
+		log.Printf("%s %s — %s", r.Method, r.URL.Path, time.Since(start))
 	})
+}
+
+func newID() string {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+func safeFilePart(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			b.WriteRune(r)
+		}
+	}
+	if b.Len() == 0 {
+		return "job"
+	}
+	if b.Len() > 16 {
+		return b.String()[:16]
+	}
+	return b.String()
 }
