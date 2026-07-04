@@ -28,6 +28,7 @@ go run .
 | `-browser` | _(auto)_ | Path to custom browser executable |
 | `-timeout` | `120s` | Per-request timeout limit |
 | `-mode` | `extension`| Default scraping mode (`extension` or `cdp`) |
+| `-version` | `version`| Check version of app thats installed |
 
 ---
 
