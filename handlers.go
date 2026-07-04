@@ -338,6 +338,7 @@ func handleExtensionCapture(hub *extensionCaptureHub) http.HandlerFunc {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
+		log.Printf("[ExtensionCapture] Job: %s, URL: %s", ev.JobID, ev.URL)
 		hub.capture(ev)
 		w.WriteHeader(http.StatusNoContent)
 	}
@@ -369,6 +370,7 @@ func handleExtensionResult(hub *extensionJobHub) http.HandlerFunc {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
+		log.Printf("[ExtensionResult] Job: %s, M3u8s: %v, AllURLs: %v, Error: %s", result.JobID, result.M3u8URLs, result.AllURLs, result.Error)
 		if !hub.complete(result) {
 			w.WriteHeader(http.StatusNotFound)
 			return

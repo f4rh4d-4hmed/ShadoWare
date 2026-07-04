@@ -101,6 +101,13 @@ func scrapeCDP(ctx, allocCtx context.Context, req TaskRequest, captureHub *exten
 	if req.UserAgent != "" {
 		actions = append(actions, emulation.SetUserAgentOverride(req.UserAgent))
 	}
+	if len(req.Headers) > 0 {
+		headers := make(network.Headers)
+		for k, v := range req.Headers {
+			headers[k] = v
+		}
+		actions = append(actions, network.SetExtraHTTPHeaders(headers))
+	}
 	actions = append(actions,
 		target.SetAutoAttach(true, false).WithFlatten(true),
 		network.Enable().WithMaxTotalBufferSize(100 * 1024 * 1024).WithMaxResourceBufferSize(maxResponseBodyScanBytes),

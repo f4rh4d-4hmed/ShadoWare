@@ -23,6 +23,7 @@ type HLSScrapeRequest struct {
 	URL          string            `json:"url"`
 	WaitMs       int               `json:"wait_ms"`
 	LocalStorage map[string]string `json:"local_storage,omitempty"`
+	Headers      map[string]string `json:"headers,omitempty"`
 }
 
 type HLSQuality struct {
@@ -73,6 +74,7 @@ func handleScrapeHLS(bm *BrowserManager, sem *semaphore.Weighted, cfg Config, ca
 			Mode:           "extension",
 			WaitMs:         req.WaitMs,
 			LocalStorage:   req.LocalStorage,
+			Headers:        req.Headers,
 			IncludeHeaders: true,
 			UserAgent:      androidChromeUA,
 			IsHLSScrape:    true,

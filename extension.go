@@ -45,6 +45,7 @@ type extensionJob struct {
 	URL          string            `json:"url"`
 	WaitMs       int               `json:"wait_ms"`
 	LocalStorage map[string]string `json:"local_storage,omitempty"`
+	Headers      map[string]string `json:"headers,omitempty"`
 	Actions      []BrowserAction   `json:"actions,omitempty"`
 	CloseTab     bool              `json:"close_tab"`
 	Stream       bool              `json:"stream"`
@@ -322,7 +323,7 @@ func ensureCaptureExtension(serverAddr string) (string, error) {
   "manifest_version": 3,
   "name": "ShadoWare Capture",
   "version": "1.0.0",
-  "permissions": ["webRequest", "tabs", "scripting"],
+  "permissions": ["webRequest", "declarativeNetRequest", "tabs", "scripting"],
   "host_permissions": ["<all_urls>"],
   "background": { "service_worker": "background.js" },
   "content_scripts": [
@@ -473,9 +474,40 @@ async function runJob(job) {
   capturedHeaders.length = 0;
   let tab;
   try {
-    tab = await chrome.tabs.create({ url: job.url, active: true });
+    tab = await chrome.tabs.create({ url: "about:blank", active: true });
     mainTabId = tab.id;
     tabJobs.set(tab.id, job.job_id);
+
+    // Apply declarative rules for custom headers
+    if (job.headers && Object.keys(job.headers).length > 0) {
+      const requestHeaders = [];
+      for (const [k, v] of Object.entries(job.headers)) {
+        requestHeaders.push({
+          header: k.toLowerCase() === "user-agent" ? "user-agent" : k,
+          operation: "set",
+          value: v
+        });
+      }
+      await chrome.declarativeNetRequest.updateSessionRules({
+        removeRuleIds: [1],
+        addRules: [
+          {
+            id: 1,
+            priority: 1,
+            action: {
+              type: "modifyHeaders",
+              requestHeaders: requestHeaders
+            },
+            condition: {
+              tabIds: [tab.id],
+              resourceTypes: ["main_frame", "sub_frame"]
+            }
+          }
+        ]
+      });
+    }
+
+    await chrome.tabs.update(tab.id, { url: job.url });
     await waitComplete(tab.id);
     if (job.local_storage && Object.keys(job.local_storage).length) {
       await chrome.scripting.executeScript({ target:{tabId:tab.id}, args:[job.local_storage],
@@ -498,6 +530,9 @@ async function runJob(job) {
       tabJobs.delete(tab.id);
       if (job.close_tab!==false) chrome.tabs.remove(tab.id).catch(()=>{});
     }
+    await chrome.declarativeNetRequest.updateSessionRules({
+      removeRuleIds: [1]
+    }).catch(()=>{});
   }
 }
 
@@ -635,6 +670,7 @@ func scrapeExtension(ctx context.Context, req TaskRequest, captureHub *extension
 		URL:          req.URL,
 		WaitMs:       req.WaitMs,
 		LocalStorage: req.LocalStorage,
+		Headers:      req.Headers,
 		Actions:      req.Actions,
 		CloseTab:     true,
 		Stream:       emit != nil,

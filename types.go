@@ -25,6 +25,7 @@ type TaskRequest struct {
 	Mode           string            `json:"mode,omitempty"`
 	WaitMs         int               `json:"wait_ms"`
 	LocalStorage   map[string]string `json:"local_storage,omitempty"`
+	Headers        map[string]string `json:"headers,omitempty"`
 	Actions        []BrowserAction   `json:"actions,omitempty"`
 	Debug          bool              `json:"debug,omitempty"`
 	IncludeHeaders bool              `json:"include_headers,omitempty"`
