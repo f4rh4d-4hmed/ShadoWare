@@ -42,10 +42,10 @@ jobs:
             target: macos-arm64
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
@@ -75,7 +75,7 @@ jobs:
           echo "artifact_path=${out}" >> "${GITHUB_OUTPUT}"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.APP_NAME }}-${{ matrix.target }}
           path: ${{ steps.build.outputs.artifact_path }}
@@ -88,14 +88,14 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     steps:
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: ${{ env.APP_NAME }}-*
           path: release-assets
           merge-multiple: true
 
       - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_type == 'tag' && github.ref_name || github.event.inputs.tag }}
           name: ${{ env.APP_NAME }} ${{ github.ref_type == 'tag' && github.ref_name || github.event.inputs.tag }}
