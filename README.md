@@ -1,8 +1,8 @@
-# WebMediaUtil (v1.0.0)
+# WebMediaUtil
 
-`WebMediaUtil` is a high-performance, completely headless, standalone subprocess utility designed to extract `.m3u8` links (HLS streams) from web pages. 
+`WebMediaUtil` is a high-performance, completely headless, standalone subprocess utility designed to extract `.m3u8` links (or HLS streams) from web pages. 
 
-By leveraging a single persistent Chromium/Chrome browser running a custom capture extension, it routes multiple scraper requests concurrently inside separate tabs. This approach avoids the 2–4 second startup/teardown overhead of spinning up browser processes per scrape request, leading to much faster extraction times and higher overall performance.
+By leveraging a single persistent Chromium/Chrome browser running a custom capture extension, it routes multiple scraper requests concurrently inside separate tabs.
 
 ---
 
@@ -22,7 +22,7 @@ Ensure you have [Go](https://go.dev/) (v1.26+) installed.
 
 ```bash
 # Navigate to the project directory
-cd MediaUtil
+cd WebMediaUtil
 
 # Build the executable
 go build -o webmediautil.exe
@@ -184,7 +184,7 @@ Returns the version of the application as plain text (e.g. `1.0.0` or `dev`).
 
 #### Response Body
 ```text
-1.0.0
+2.0.1
 ```
 
 ---
