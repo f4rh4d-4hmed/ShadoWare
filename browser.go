@@ -83,7 +83,6 @@ func (bd *BrowserDaemon) monitorLoop() {
 			continue
 		}
 
-		// Wait for the browser to exit (e.g. crash or stopped)
 		err = cmd.Wait()
 
 		bd.mu.Lock()
@@ -172,7 +171,6 @@ func (bd *BrowserDaemon) Status() map[string]interface{} {
 func buildBrowserArgs(extensionDir, profileDir string, headless bool) []string {
 	args := []string{
 		"--user-data-dir=" + profileDir,
-		"--no-sandbox",
 		"--disable-gpu",
 		"--disable-dev-shm-usage",
 		"--no-first-run",
@@ -202,6 +200,9 @@ func buildBrowserArgs(extensionDir, profileDir string, headless bool) []string {
 		"--js-flags=--max-old-space-size=256",
 		"--disable-logging",
 		"about:blank",
+	}
+	if runtime.GOOS == "linux" {
+		args = append(args, "--no-sandbox")
 	}
 	if headless {
 		args = append([]string{"--headless=new"}, args...)

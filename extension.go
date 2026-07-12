@@ -63,7 +63,7 @@ type extensionJobResult struct {
 type extensionJobHub struct {
 	mu      sync.Mutex
 	queue   []*extensionJob
-	head    int // index of the next job to dequeue; avoids O(n) slice shift
+	head    int
 	results map[string]chan extensionJobResult
 }
 
@@ -88,14 +88,12 @@ func (h *extensionJobHub) next() (*extensionJob, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.head >= len(h.queue) {
-		// Queue is empty — reset to free memory
 		h.queue = h.queue[:0]
 		h.head = 0
 		return nil, false
 	}
 	job := h.queue[h.head]
 	h.head++
-	// Compact once half the slice is consumed dead slots
 	if h.head > 64 && h.head > len(h.queue)/2 {
 		h.queue = append(h.queue[:0], h.queue[h.head:]...)
 		h.head = 0
@@ -122,7 +120,6 @@ func (h *extensionJobHub) cancel(jobID string) {
 	for i := h.head; i < len(h.queue); i++ {
 		if h.queue[i].JobID == jobID {
 			h.queue = append(h.queue[:i], h.queue[i+1:]...)
-			// Removing from the middle does not affect head since i >= h.head
 			break
 		}
 	}
@@ -317,7 +314,6 @@ const contentScript = `(function() {
 })();`
 
 func ensureCaptureExtension(serverAddr string) (string, error) {
-	// Use the port in the dir name so concurrent server instances don't collide
 	portPart := strings.TrimPrefix(serverAddr, ":")
 	dir := filepath.Join(os.TempDir(), fmt.Sprintf("webmediautil-ext-%s", portPart))
 	if err := os.MkdirAll(dir, 0755); err != nil {

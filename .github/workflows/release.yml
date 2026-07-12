@@ -69,9 +69,6 @@ jobs:
           if [ -n "${VERSION}" ]; then
             LDFLAGS="${LDFLAGS} -X main.Version=${VERSION}"
           fi
-          if [ "${{ matrix.goos }}" = "windows" ]; then
-            LDFLAGS="${LDFLAGS} -H=windowsgui"
-          fi
 
           CGO_ENABLED=0 GOOS="${{ matrix.goos }}" GOARCH="${{ matrix.goarch }}" \
             go build -trimpath -ldflags="${LDFLAGS}" -o "${out}" .

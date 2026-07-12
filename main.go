@@ -16,7 +16,6 @@ import (
 	"time"
 )
 
-// Version of WebMediaUtil. Can be overridden at build time.
 var Version = "dev"
 
 func parseConfig() Config {
@@ -65,7 +64,6 @@ func listenWithRetry(requestedPort string) (net.Listener, string, error) {
 func main() {
 	cfg := parseConfig()
 
-	// 1. Resolve browser executable path
 	browserPath := cfg.Browser
 	var browserName string
 	if browserPath == "" {
@@ -78,18 +76,15 @@ func main() {
 	}
 	log.Printf("Using browser: %s (%s)", browserName, browserPath)
 
-	// 2. Bind port with collision auto-increment
 	ln, boundPort, err := listenWithRetry(cfg.Port)
 	if err != nil {
 		log.Fatalf("Failed to bind to any port: %v", err)
 	}
 	cfg.Port = boundPort
 
-	// Output to stdout to let the parent process know the bound port
 	fmt.Printf("PORT_BOUND: %s\n", boundPort)
 	os.Stdout.Sync()
 
-	// 3. Prepare capture extension files with the actual bound port
 	captureExtensionDir, err := ensureCaptureExtension(cfg.Port)
 	if err != nil {
 		_ = ln.Close()
@@ -97,7 +92,6 @@ func main() {
 	}
 	log.Printf("Capture extension ready at %s", captureExtensionDir)
 
-	// 4. Start persistent browser daemon
 	bd := NewBrowserDaemon(browserPath, browserName, captureExtensionDir, cfg.Headless)
 	bd.Start()
 
@@ -126,9 +120,7 @@ func main() {
 
 	shutdown := func(reason string) {
 		log.Printf("Shutting down: %s", reason)
-		// Stop the browser and clean up profile dir
 		bd.Stop()
-		// Clean up the temp extension files
 		_ = os.RemoveAll(captureExtensionDir)
 
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -138,7 +130,6 @@ func main() {
 		}
 	}
 
-	// Listen for system termination signals
 	go func() {
 		quit := make(chan os.Signal, 1)
 		signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -146,7 +137,6 @@ func main() {
 		shutdown(fmt.Sprintf("signal %s received", sig))
 	}()
 
-	// Start parent process watchdog if not disabled
 	if !cfg.DisableWatchdog {
 		startParentWatchdog(shutdown)
 	} else {

@@ -184,7 +184,6 @@ func dedupe(in []string) []string {
 
 func startParentWatchdog(shutdown func(string)) {
 	ppid := os.Getppid()
-	// Disable watchdog if started without a specific parent or if adopting init process
 	if ppid <= 4 {
 		log.Printf("Watchdog disabled: parent PID %d is system/init process", ppid)
 		return
@@ -308,7 +307,6 @@ func validateAndParseHLS(ctx context.Context, manifestURL string, headers map[st
 				quality := "unknown"
 				if resMatch := resolutionRegex.FindStringSubmatch(currentInfo); len(resMatch) > 1 {
 					quality = resMatch[1]
-					// Append bandwidth when both are present
 					if bwMatch := bandwidthRegex.FindStringSubmatch(currentInfo); len(bwMatch) > 1 {
 						bandwidth, _ := strconv.Atoi(bwMatch[1])
 						quality = fmt.Sprintf("%s @ %d Kbps", quality, bandwidth/1000)
