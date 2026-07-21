@@ -206,3 +206,86 @@ Returns the configuration flags and status of the persistent background browser 
   "uptime": "5m23s"
 }
 ```
+
+---
+
+### 6. Scrape Image Manifest (`POST /scrape/ajaximg`)
+
+Recommended for extracting ordered page-image lists from manga, webtoon, and book-reader sites. It navigates to the reader page, intercepts all `fetch`/`XMLHttpRequest` response bodies (via a patched content script injected by the extension), scores each JSON/XML response by how many image URLs it contains, and returns the ordered, deduplicated image list from the highest-scoring response(s).
+
+If no response scores above the minimum threshold (e.g. the site loads images individually rather than via a JSON manifest), it falls back to returning all image-extension URLs seen as network requests, and sets `fallback_used: true` so callers can distinguish the two modes.
+
+#### Request Body
+- `url` (string, required): The URL of the manga/comic/book reader page.
+- `wait_ms` (int, optional): Duration in milliseconds to wait after page load (max 15000ms). Useful for pages that lazy-load the manifest on scroll.
+- `headers` (map[string]string, optional): Key-value pairs of request headers to apply.
+- `local_storage` (map[string]string, optional): Local storage keys/values to inject before loading the page.
+- `actions` (array, optional): Custom browser actions to run before capture (same action types as `/execute` — `click`, `scroll`, `wait`, `eval`, etc.). Useful for triggering lazy-loaded manifests.
+- `url_patterns` (array of strings, optional): Regex allowlist to restrict which response URLs are even considered as manifest candidates. Example: `["/api/chapter/", "/pages/"]`. Default: consider all JSON/XML responses.
+- `image_ext_regex` (string, optional): Override the default image-URL regex. Useful for CDNs that serve extensionless URLs (e.g. `?format=webp`). Default matches `.jpg`, `.jpeg`, `.png`, `.webp`, `.avif`, `.gif`.
+- `min_match_count` (int, optional): Minimum number of image URLs a response must contain to qualify as a manifest candidate. Default `3`.
+- `accumulate_all` (bool, optional): Default `true` — accumulate image URLs from **all** qualifying responses (for paginated/batched manifests). Set to `false` to return only the single highest-scoring response.
+- `debug` (bool, optional): Include a `candidates` array of all scored responses in the output.
+
+```json
+{
+  "url": "https://manga-reader.example.com/chapter/42",
+  "wait_ms": 2000,
+  "headers": {
+    "Referer": "https://manga-reader.example.com/"
+  },
+  "url_patterns": ["/api/chapter/"],
+  "min_match_count": 3,
+  "accumulate_all": true
+}
+```
+
+#### Response Body (Success)
+- `images` (array): Ordered, deduplicated list of image URLs for the chapter/volume.
+- `manifest_urls` (array): The API response URL(s) identified as the manifest source.
+- `headers` (map[string]string): Headers useful for fetching the images (`Referer`, `Origin`), derived from the reader page URL.
+- `fallback_used` (bool): `true` if no response scored above the threshold and the endpoint fell back to raw network-request capture.
+- `candidates` (array, only if `debug: true`): All scored candidate responses with their URL, content-type, match count, and detected format (`"json"` | `"xml"` | `"unknown"`).
+
+```json
+{
+  "images": [
+    "https://cdn.example.com/chapter/42/page-001.jpg",
+    "https://cdn.example.com/chapter/42/page-002.jpg",
+    "https://cdn.example.com/chapter/42/page-003.jpg"
+  ],
+  "manifest_urls": [
+    "https://manga-reader.example.com/api/chapter/42/pages"
+  ],
+  "headers": {
+    "Referer": "https://manga-reader.example.com/chapter/42",
+    "Origin": "https://manga-reader.example.com"
+  },
+  "fallback_used": false
+}
+```
+
+#### Response Body (Fallback — no manifest found)
+```json
+{
+  "images": [
+    "https://cdn.example.com/page-001.jpg",
+    "https://cdn.example.com/page-002.jpg"
+  ],
+  "manifest_urls": [],
+  "headers": {
+    "Referer": "https://manga-reader.example.com/chapter/42",
+    "Origin": "https://manga-reader.example.com"
+  },
+  "fallback_used": true
+}
+```
+
+#### Response Body (Error)
+```json
+{
+  "images": [],
+  "manifest_urls": [],
+  "error": "url must be a valid http/https URL"
+}
+```

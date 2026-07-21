@@ -102,6 +102,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /execute", handleExecute(bd, sem, cfg, captureHub, jobHub))
 	mux.HandleFunc("POST /scrape/hls", handleScrapeHLS(bd, sem, cfg, captureHub, jobHub))
+	mux.HandleFunc("POST /scrape/ajaximg", handleScrapeAjaxImg(bd, sem, cfg, captureHub, jobHub))
 	mux.HandleFunc("GET /health", handleHealth)
 	mux.HandleFunc("GET /config", handleConfigGet(cfg, bd))
 	mux.HandleFunc("GET /version", handleVersion)

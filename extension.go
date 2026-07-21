@@ -39,25 +39,27 @@ type extensionCaptureHub struct {
 }
 
 type extensionJob struct {
-	JobID        string            `json:"job_id"`
-	URL          string            `json:"url"`
-	WaitMs       int               `json:"wait_ms"`
-	LocalStorage map[string]string `json:"local_storage,omitempty"`
-	Headers      map[string]string `json:"headers,omitempty"`
-	Actions      []BrowserAction   `json:"actions,omitempty"`
-	CloseTab     bool              `json:"close_tab"`
-	Stream       bool              `json:"stream"`
-	Debug        bool              `json:"debug"`
-	IsHLSScrape  bool              `json:"is_hls_scrape,omitempty"`
+	JobID             string            `json:"job_id"`
+	URL               string            `json:"url"`
+	WaitMs            int               `json:"wait_ms"`
+	LocalStorage      map[string]string `json:"local_storage,omitempty"`
+	Headers           map[string]string `json:"headers,omitempty"`
+	Actions           []BrowserAction   `json:"actions,omitempty"`
+	CloseTab          bool              `json:"close_tab"`
+	Stream            bool              `json:"stream"`
+	Debug             bool              `json:"debug"`
+	IsHLSScrape       bool              `json:"is_hls_scrape,omitempty"`
+	IsManifestScrape  bool              `json:"is_manifest_scrape,omitempty"`
 }
 
 type extensionJobResult struct {
-	JobID    string        `json:"job_id"`
-	Content  string        `json:"content"`
-	Error    string        `json:"error,omitempty"`
-	M3u8URLs []string      `json:"m3u8_urls,omitempty"`
-	AllURLs  []string      `json:"all_urls,omitempty"`
-	Captures []m3u8Capture `json:"captures,omitempty"`
+	JobID        string         `json:"job_id"`
+	Content      string         `json:"content"`
+	Error        string         `json:"error,omitempty"`
+	M3u8URLs     []string       `json:"m3u8_urls,omitempty"`
+	AllURLs      []string       `json:"all_urls,omitempty"`
+	Captures     []m3u8Capture  `json:"captures,omitempty"`
+	AjaxCaptures []ajaxCapture  `json:"ajax_captures,omitempty"`
 }
 
 type extensionJobHub struct {
@@ -195,13 +197,17 @@ const contentScript = `(function() {
     }
   }, true);
 
-  // 2. Query background script if HLS scraper / solver should run
+  // 2. Query background script to determine which scrapers should run.
   chrome.runtime.sendMessage({ type: "GET_SCRAPER_STATE" }, (response) => {
     if (response && response.active) {
       startSolver();
     }
+    if (response && response.isManifestScrape) {
+      startManifestCapture();
+    }
   });
 
+  // ─── HLS / Turnstile solver ────────────────────────────────────────────────
   function startSolver() {
     console.log("HLS Scraper solver active in frame:", window.location.href);
 
@@ -311,7 +317,100 @@ const contentScript = `(function() {
     checkTurnstile();
     checkVideoPlay();
   }
+
+  // ─── Manifest (AJAX image-list) capture ───────────────────────────────────
+  // Listens for CustomEvents fired by content_main.js (which runs in the MAIN
+  // world and patches window.fetch / XMLHttpRequest directly on the page's
+  // globals). This isolated-world script forwards captured bodies to the
+  // background service worker via chrome.runtime.sendMessage, which is not
+  // available in the MAIN world. Activation is gated on isManifestScrape so
+  // it is a no-op for HLS/execute tabs.
+  function startManifestCapture() {
+    console.log("Manifest capture listener active in frame:", window.location.href);
+    window.addEventListener('__wmu_ajax_capture', function(e) {
+      if (!e || !e.detail) return;
+      chrome.runtime.sendMessage({
+        type: "AJAX_RESPONSE_BODY",
+        url: e.detail.url,
+        content_type: e.detail.content_type,
+        body: e.detail.body,
+        truncated: e.detail.truncated
+      }).catch(() => {});
+    });
+  }
 })();`
+
+// contentMainScript runs in the MAIN world (the page's own JavaScript context)
+// so it can patch the real window.fetch and XMLHttpRequest that page code uses.
+// It fires CustomEvents (not chrome.runtime.sendMessage, which is unavailable in
+// the MAIN world) so the isolated-world content.js can receive and forward them.
+// This script is always injected but only sends events; the isolated-world script
+// gates forwarding based on whether the tab is a manifest-scrape job.
+const contentMainScript = `(function() {
+  const BODY_CAP = 2 * 1024 * 1024; // 2 MB cap — must match maxResponseBodyScanBytes on the Go side
+  const EV = '__wmu_ajax_capture';
+
+  function looksLikeData(ct) {
+    if (!ct) return false;
+    const lower = ct.toLowerCase();
+    return lower.includes('json') || lower.includes('xml') ||
+           lower.includes('text/plain') || lower.includes('text/html') ||
+           lower.includes('application/octet-stream') ||
+           lower.includes('application/x-www-form-urlencoded');
+  }
+
+  function dispatch(url, contentType, text) {
+    let body = text;
+    let truncated = false;
+    if (text && text.length > BODY_CAP) {
+      body = text.slice(0, BODY_CAP);
+      truncated = true;
+    }
+    window.dispatchEvent(new CustomEvent(EV, {
+      detail: { url: url, content_type: contentType || '', body: body, truncated: truncated }
+    }));
+  }
+
+  // ── Patch window.fetch ────────────────────────────────────────────────────
+  const _fetch = window.fetch.bind(window);
+  window.fetch = function(input, init) {
+    const url = (typeof input === 'string') ? input
+              : (input && input.url) ? input.url : String(input);
+    return _fetch(input, init).then(function(response) {
+      const clone = response.clone();
+      const ct = clone.headers.get('content-type') || '';
+      if (looksLikeData(ct)) {
+        clone.text().then(function(text) { dispatch(url, ct, text); }).catch(function() {});
+      }
+      return response;
+    });
+  };
+
+  // ── Patch XMLHttpRequest ──────────────────────────────────────────────────
+  const _XHROpen = XMLHttpRequest.prototype.open;
+  const _XHRSend = XMLHttpRequest.prototype.send;
+
+  XMLHttpRequest.prototype.open = function(method, url) {
+    this._wmuURL = typeof url === 'string' ? url : String(url);
+    return _XHROpen.apply(this, arguments);
+  };
+
+  XMLHttpRequest.prototype.send = function() {
+    var self = this;
+    this.addEventListener('load', function() {
+      try {
+        var ct = self.getResponseHeader('content-type') || '';
+        if (looksLikeData(ct)) {
+          var text = typeof self.responseText === 'string' ? self.responseText : '';
+          dispatch(self._wmuURL || '', ct, text);
+        }
+      } catch(e) {}
+    });
+    return _XHRSend.apply(this, arguments);
+  };
+})();`
+
+
 
 func ensureCaptureExtension(serverAddr string) (string, error) {
 	portPart := strings.TrimPrefix(serverAddr, ":")
@@ -328,6 +427,13 @@ func ensureCaptureExtension(serverAddr string) (string, error) {
   "host_permissions": ["<all_urls>"],
   "background": { "service_worker": "background.js" },
   "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content_main.js"],
+      "run_at": "document_start",
+      "all_frames": true,
+      "world": "MAIN"
+    },
     {
       "matches": ["<all_urls>"],
       "js": ["content.js"],
@@ -419,12 +525,35 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (sender.tab && sender.tab.id !== undefined) {
       const context = jobs.get(sender.tab.id);
       if (context) {
-        sendResponse({ active: !!context.isHLSScrape });
+        sendResponse({
+          active: !!context.isHLSScrape,
+          isManifestScrape: !!context.isManifestScrape
+        });
         return true;
       }
     }
-    sendResponse({ active: false });
+    sendResponse({ active: false, isManifestScrape: false });
+    return true;
   }
+
+  if (message.type === "AJAX_RESPONSE_BODY") {
+    // Received from the content script's fetch/XHR monkey-patch.
+    // Append to capturedAjax for this tab so the final result POST includes it.
+    if (sender.tab && sender.tab.id !== undefined) {
+      const context = jobs.get(sender.tab.id);
+      if (context && context.isManifestScrape) {
+        context.capturedAjax.push({
+          url: message.url || "",
+          content_type: message.content_type || "",
+          body: message.body || "",
+          truncated: !!message.truncated
+        });
+      }
+    }
+    sendResponse({});
+    return true;
+  }
+
   return true;
 });
 
@@ -486,9 +615,11 @@ async function runJob(job) {
       debug: job.debug,
       stream: job.stream,
       isHLSScrape: job.is_hls_scrape,
+      isManifestScrape: job.is_manifest_scrape,
       capturedUrls: [],
       capturedMedia: [],
       capturedHeaders: [],
+      capturedAjax: [],
       pendingHeaders: new Map()
     };
     jobs.set(tabId, context);
@@ -542,10 +673,25 @@ async function runJob(job) {
     })();
 
     const content = await Promise.race([workPromise, timeoutPromise]);
-    await post(RESULT, { job_id: jobId, content: content, m3u8_urls: context.capturedMedia, all_urls: context.capturedUrls, captures: context.capturedHeaders });
+    await post(RESULT, {
+      job_id: jobId,
+      content: content,
+      m3u8_urls: context.capturedMedia,
+      all_urls: context.capturedUrls,
+      captures: context.capturedHeaders,
+      ajax_captures: context.capturedAjax
+    });
   } catch(e) {
-    const context = jobByJobId.get(jobId) || { capturedMedia: [], capturedUrls: [], capturedHeaders: [] };
-    await post(RESULT, { job_id: jobId, content: "", error: e&&e.message?e.message:String(e), m3u8_urls: context.capturedMedia, all_urls: context.capturedUrls, captures: context.capturedHeaders }).catch(()=>{});
+    const context = jobByJobId.get(jobId) || { capturedMedia: [], capturedUrls: [], capturedHeaders: [], capturedAjax: [] };
+    await post(RESULT, {
+      job_id: jobId,
+      content: "",
+      error: e&&e.message?e.message:String(e),
+      m3u8_urls: context.capturedMedia,
+      all_urls: context.capturedUrls,
+      captures: context.capturedHeaders,
+      ajax_captures: context.capturedAjax
+    }).catch(()=>{});
   } finally {
     if (timer) clearTimeout(timer);
     if (tab && tab.id !== undefined) {
@@ -576,10 +722,14 @@ async function poll() {
 poll();
 `, apiBase)
 
+
 	if err := os.WriteFile(filepath.Join(dir, "manifest.json"), []byte(manifest), 0644); err != nil {
 		return "", err
 	}
 	if err := os.WriteFile(filepath.Join(dir, "background.js"), []byte(background), 0644); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(filepath.Join(dir, "content_main.js"), []byte(contentMainScript), 0644); err != nil {
 		return "", err
 	}
 	if err := os.WriteFile(filepath.Join(dir, "content.js"), []byte(contentScript), 0644); err != nil {
@@ -624,16 +774,17 @@ func scrapeExtension(ctx context.Context, req TaskRequest, captureHub *extension
 	defer unregister()
 
 	resultCh := jobHub.enqueue(&extensionJob{
-		JobID:        jobID,
-		URL:          req.URL,
-		WaitMs:       req.WaitMs,
-		LocalStorage: req.LocalStorage,
-		Headers:      req.Headers,
-		Actions:      req.Actions,
-		CloseTab:     true,
-		Stream:       emit != nil,
-		Debug:        req.Debug || req.IncludeHeaders,
-		IsHLSScrape:  req.IsHLSScrape,
+		JobID:            jobID,
+		URL:              req.URL,
+		WaitMs:           req.WaitMs,
+		LocalStorage:     req.LocalStorage,
+		Headers:          req.Headers,
+		Actions:          req.Actions,
+		CloseTab:         true,
+		Stream:           emit != nil,
+		Debug:            req.Debug || req.IncludeHeaders,
+		IsHLSScrape:      req.IsHLSScrape,
+		IsManifestScrape: req.IsManifestScrape,
 	})
 
 	var result extensionJobResult
@@ -666,4 +817,70 @@ func scrapeExtension(ctx context.Context, req TaskRequest, captureHub *extension
 		return result.Content, m3u8s, all, caps, errors.New(result.Error)
 	}
 	return result.Content, m3u8s, all, caps, nil
+}
+
+// scrapeManifestExtension is like scrapeExtension but also returns the AJAX
+// response bodies captured by the extension's fetch/XHR monkey-patch.
+// It is used exclusively by the /scrape/ajaximg handler.
+func scrapeManifestExtension(ctx context.Context, req TaskRequest, captureHub *extensionCaptureHub, jobHub *extensionJobHub) (string, []string, []ajaxCapture, error) {
+	var (
+		allURLs []string
+		mu      sync.Mutex
+	)
+
+	trackURL := func(u string) {
+		u = normalizeCapturedURL(u, req.URL)
+		if u == "" {
+			return
+		}
+		mu.Lock()
+		allURLs = append(allURLs, u)
+		mu.Unlock()
+	}
+	trackText := func(text, baseURL string) {
+		for _, u := range extractCandidateURLs(text, baseURL) {
+			trackURL(u)
+		}
+	}
+
+	jobID := fmt.Sprintf("%d-%d", time.Now().UnixNano(), nextExtensionJobID.Add(1))
+
+	unregister := captureHub.register(jobID, req.URL, trackURL)
+	defer unregister()
+
+	resultCh := jobHub.enqueue(&extensionJob{
+		JobID:            jobID,
+		URL:              req.URL,
+		WaitMs:           req.WaitMs,
+		LocalStorage:     req.LocalStorage,
+		Headers:          req.Headers,
+		Actions:          req.Actions,
+		CloseTab:         true,
+		Stream:           false,
+		Debug:            true, // always collect all_urls for fallback mode
+		IsManifestScrape: true,
+	})
+
+	var result extensionJobResult
+	select {
+	case result = <-resultCh:
+	case <-ctx.Done():
+		jobHub.cancel(jobID)
+		return "", dedupe(allURLs), nil, ctx.Err()
+	}
+
+	trackText(result.Content, req.URL)
+
+	mu.Lock()
+	if len(result.AllURLs) > 0 {
+		allURLs = append(allURLs, result.AllURLs...)
+	}
+	all := dedupe(append([]string(nil), allURLs...))
+	ajax := append([]ajaxCapture(nil), result.AjaxCaptures...)
+	mu.Unlock()
+
+	if result.Error != "" {
+		return result.Content, all, ajax, errors.New(result.Error)
+	}
+	return result.Content, all, ajax, nil
 }

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"net/url"
@@ -352,6 +353,59 @@ func captureSliceToHeaders(caps []m3u8Capture) []CapturedURLHeader {
 		})
 	}
 	return out
+}
+
+func handleScrapeAjaxImg(bd *BrowserDaemon, sem Semaphore, cfg Config, captureHub *extensionCaptureHub, jobHub *extensionJobHub) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeManifestError(w, "Only POST allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req ManifestScrapeRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeManifestError(w, "Invalid JSON: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		if req.URL == "" {
+			writeManifestError(w, "url is required", http.StatusBadRequest)
+			return
+		}
+		parsed, err := url.ParseRequestURI(req.URL)
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+			writeManifestError(w, "url must be a valid http/https URL", http.StatusBadRequest)
+			return
+		}
+		if req.WaitMS < 0 || req.WaitMS > 15_000 {
+			writeManifestError(w, "wait_ms must be between 0 and 15000", http.StatusBadRequest)
+			return
+		}
+		for i, a := range req.Actions {
+			if err := validateBrowserAction(a); err != nil {
+				writeManifestError(w, fmt.Sprintf("actions[%d]: %s", i, err.Error()), http.StatusBadRequest)
+				return
+			}
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), cfg.Timeout)
+		defer cancel()
+
+		if !sem.TryAcquire() {
+			writeManifestError(w, "Server busy, try again shortly", http.StatusServiceUnavailable)
+			return
+		}
+		defer sem.Release()
+
+		resp, _ := scrapeManifest(ctx, req, captureHub, jobHub)
+		writeJSON(w, http.StatusOK, resp)
+	}
+}
+
+func writeManifestError(w http.ResponseWriter, msg string, code int) {
+	writeJSON(w, code, ManifestScrapeResponse{
+		Images:       []string{},
+		ManifestURLs: []string{},
+		Error:        msg,
+	})
 }
 
 func writeJSON(w http.ResponseWriter, code int, v interface{}) {

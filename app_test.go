@@ -13,7 +13,6 @@ import (
 )
 
 func TestEndpoints(t *testing.T) {
-	// 1. Setup mock target server serving a mock m3u8 URL
 	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
 		w.WriteHeader(http.StatusOK)
@@ -33,14 +32,12 @@ func TestEndpoints(t *testing.T) {
 	}))
 	defer mockServer.Close()
 
-	// 2. Locate browser
 	browserPath, browserName := findBrowser()
 	if browserPath == "" {
 		t.Skip("Skipping test: no Chromium browser found on system")
 	}
 	t.Logf("Using browser: %s (%s)", browserName, browserPath)
 
-	// 3. Prepare capture extension
 	apiPort := ":9898"
 	captureDir, err := ensureCaptureExtension(apiPort)
 	if err != nil {
@@ -48,7 +45,6 @@ func TestEndpoints(t *testing.T) {
 	}
 	defer os.RemoveAll(captureDir)
 
-	// 4. Start browser daemon
 	bd := NewBrowserDaemon(browserPath, browserName, captureDir, true)
 	bd.Start()
 	defer bd.Stop()
@@ -75,10 +71,8 @@ func TestEndpoints(t *testing.T) {
 	apiServer.Start()
 	defer apiServer.Close()
 
-	// Wait 1 second for the browser daemon to connect and extension to register
 	time.Sleep(1 * time.Second)
 
-	// 5. Verify /health
 	resp, err := http.Get("http://127.0.0.1" + apiPort + "/health")
 	if err != nil {
 		t.Fatalf("Failed to query /health: %v", err)
@@ -95,7 +89,6 @@ func TestEndpoints(t *testing.T) {
 		t.Errorf("Expected status: ok, got: %s", healthData["status"])
 	}
 
-	// 6. Verify /version
 	resp, err = http.Get("http://127.0.0.1" + apiPort + "/version")
 	if err != nil {
 		t.Fatalf("Failed to query /version: %v", err)
@@ -107,7 +100,6 @@ func TestEndpoints(t *testing.T) {
 		t.Errorf("Expected version %s, got %s", Version, versionStr)
 	}
 
-	// 7. Verify /execute scraper
 	reqBody := TaskRequest{
 		URL:    mockServer.URL,
 		WaitMs: 1000,
